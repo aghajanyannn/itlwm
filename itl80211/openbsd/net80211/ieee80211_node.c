@@ -69,6 +69,16 @@
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_priv.h>
 
+/*
+ * Not upstream. Cross-translation-unit layout check for struct ieee80211com — see the assignment
+ * in iwx_attach() for why. Both are plain u32s written once at attach and compared by
+ * AirportItlwm; a mismatch means one object file was built against a stale ieee80211_var.h and
+ * every ic_* offset in that object is wrong.
+ */
+extern "C" uint32_t gItlwmIcSizeHal;
+extern "C" uint32_t gItlwmIcSizeNet;
+uint32_t gItlwmIcSizeNet;
+
 struct ieee80211_node *ieee80211_node_alloc(struct ieee80211com *);
 void ieee80211_node_free(struct ieee80211com *, struct ieee80211_node *);
 void ieee80211_node_copy(struct ieee80211com *, struct ieee80211_node *,
@@ -399,16 +409,32 @@ ieee80211_add_ess(struct ieee80211com *ic, struct ieee80211_join *join)
         ess = (struct ieee80211_ess *)malloc(sizeof(*ess), 0, 0);
         if (ess == NULL)
             return (ENOMEM);
+        /*
+         * Not upstream, because upstream passes M_ZERO and this port's malloc shim ignores its
+         * flags. Only essid/esslen are assigned below; everything else — flags, the RSN
+         * parameters, the PSK — is then read-modify-written from uninitialised heap.
+         */
+        memset(ess, 0, sizeof(*ess));
         memcpy(ess->essid, join->i_nwid, join->i_len);
         ess->esslen = join->i_len;
     }
     
+    /*
+     * The three error paths below used to free `ess` unconditionally. When the TAILQ_FOREACH above
+     * *found* an existing entry, new_value is 0 and that entry is still linked into ic_ess — so
+     * the free left a dangling pointer in the list, and the next ieee80211_switch_ess walked it
+     * into ieee80211_match_ess with a pointer to reused memory. Only free what this call
+     * allocated.
+     */
+#define ITLWM_ADD_ESS_FAIL(err) do {                                        \
+        if (new_value)                                                      \
+            free(ess);                                                      \
+        return (err);                                                       \
+    } while (0)
     if (join->i_flags & IEEE80211_JOIN_WPA) {
         if (join->i_wpaparams.i_enabled) {
-            if (!(ic->ic_caps & IEEE80211_C_RSN)) {
-                free(ess);
-                return ENODEV;
-            }
+            if (!(ic->ic_caps & IEEE80211_C_RSN))
+                ITLWM_ADD_ESS_FAIL(ENODEV);
             ieee80211_ess_setwpaparms(ess,
                                       &join->i_wpaparams);
             if (join->i_flags & IEEE80211_JOIN_WPAPSK) {
@@ -423,20 +449,19 @@ ieee80211_add_ess(struct ieee80211com *ic, struct ieee80211_join *join)
         }
     } else if (join->i_flags & IEEE80211_JOIN_NWKEY) {
         if (join->i_nwkey.i_wepon) {
-            if (!(ic->ic_caps & IEEE80211_C_WEP)) {
-                free(ess);
-                return ENODEV;
-            }
+            if (!(ic->ic_caps & IEEE80211_C_WEP))
+                ITLWM_ADD_ESS_FAIL(ENODEV);
             ieee80211_ess_setnwkeys(ess, &join->i_nwkey);
             ieee80211_ess_clear_wpa(ess);
         } else {
             ieee80211_ess_clear_wep(ess);
         }
     }
-    
+#undef ITLWM_ADD_ESS_FAIL
+
     if (new_value)
         TAILQ_INSERT_TAIL(&ic->ic_ess, ess, ess_next);
-    
+
     return (0);
 }
 
@@ -703,6 +728,9 @@ ieee80211_set_ess(struct ieee80211com *ic, struct ieee80211_ess *ess,
 void
 ieee80211_deselect_ess(struct ieee80211com *ic)
 {
+    /* Not upstream: see ic_ess_clears in ieee80211com. */
+    ic->ic_ess_clears++;
+    ic->ic_ess_clear_state = (u_int32_t)ic->ic_state;
     memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
     ic->ic_des_esslen = 0;
     ieee80211_disable_wep(ic);
@@ -755,6 +783,8 @@ ieee80211_node_attach(struct _ifnet *ifp)
     }
 #endif
     TAILQ_INIT(&ic->ic_ess);
+    /* Not upstream. net80211's view of the struct; see gItlwmIcSizeHal in ItlIwx.cpp. */
+    gItlwmIcSizeNet = (u_int32_t)sizeof(struct ieee80211com);
 }
 
 struct ieee80211_node *
@@ -1094,45 +1124,68 @@ ieee80211_match_bss(struct ieee80211com *ic, struct ieee80211_node *ni,
         !IEEE80211_ADDR_EQ(ic->ic_des_bssid, ni->ni_bssid))
         fail |= IEEE80211_NODE_ASSOCFAIL_BSSID;
     
+    /*
+     * Not upstream: rsnfail records *which* of the tests below rejected the candidate. Every one
+     * of them sets the same ASSOCFAIL_WPA_PROTO bit, which is all a caller can otherwise learn.
+     * Kept as a parallel assignment beside each existing line rather than as a restructuring, so a
+     * diff against OpenBSD still lines up.
+     */
+    ic->ic_scan_rsn_last = 0;
     if (ic->ic_flags & IEEE80211_F_RSNON) {
         /*
          * If at least one RSN IE field from the AP's RSN IE fails
          * to overlap with any value the STA supports, the STA shall
          * decline to associate with that AP.
          */
-        if ((ni->ni_rsnprotos & ic->ic_rsnprotos) == 0)
+        if ((ni->ni_rsnprotos & ic->ic_rsnprotos) == 0) {
             fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
-        if ((ni->ni_rsnakms & ic->ic_rsnakms) == 0)
+            ic->ic_scan_rsn_last |= IEEE80211_RSNFAIL_PROTO;
+        }
+        if ((ni->ni_rsnakms & ic->ic_rsnakms) == 0) {
             fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
+            ic->ic_scan_rsn_last |= IEEE80211_RSNFAIL_AKM;
+        }
         if ((ni->ni_rsnakms & ic->ic_rsnakms &
              ~(IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK)) == 0) {
             /* AP only supports PSK AKMPs */
-            if (!(ic->ic_flags & IEEE80211_F_PSK))
+            if (!(ic->ic_flags & IEEE80211_F_PSK)) {
                 fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
+                ic->ic_scan_rsn_last |= IEEE80211_RSNFAIL_PSK;
+            }
         }
         if (ni->ni_rsngroupcipher != IEEE80211_CIPHER_WEP40 &&
             ni->ni_rsngroupcipher != IEEE80211_CIPHER_TKIP &&
             ni->ni_rsngroupcipher != IEEE80211_CIPHER_CCMP &&
-            ni->ni_rsngroupcipher != IEEE80211_CIPHER_WEP104)
+            ni->ni_rsngroupcipher != IEEE80211_CIPHER_WEP104) {
             fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
-        if ((ni->ni_rsnciphers & ic->ic_rsnciphers) == 0)
+            ic->ic_scan_rsn_last |= IEEE80211_RSNFAIL_GROUP;
+        }
+        if ((ni->ni_rsnciphers & ic->ic_rsnciphers) == 0) {
             fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
-        
+            ic->ic_scan_rsn_last |= IEEE80211_RSNFAIL_CIPHER;
+        }
+
         /* we only support BIP as the IGTK cipher */
         if ((ni->ni_rsncaps & IEEE80211_RSNCAP_MFPC) &&
-            ni->ni_rsngroupmgmtcipher != IEEE80211_CIPHER_BIP)
+            ni->ni_rsngroupmgmtcipher != IEEE80211_CIPHER_BIP) {
             fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
-        
+            ic->ic_scan_rsn_last |= IEEE80211_RSNFAIL_IGTK;
+        }
+
         /* we do not support MFP but AP requires it */
         if (!(ic->ic_caps & IEEE80211_C_MFP) &&
-            (ni->ni_rsncaps & IEEE80211_RSNCAP_MFPR))
+            (ni->ni_rsncaps & IEEE80211_RSNCAP_MFPR)) {
             fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
-        
+            ic->ic_scan_rsn_last |= IEEE80211_RSNFAIL_MFP_REQ_AP;
+        }
+
         /* we require MFP but AP does not support it */
         if ((ic->ic_caps & IEEE80211_C_MFP) &&
             (ic->ic_flags & IEEE80211_F_MFPR) &&
-            !(ni->ni_rsncaps & IEEE80211_RSNCAP_MFPC))
+            !(ni->ni_rsncaps & IEEE80211_RSNCAP_MFPC)) {
             fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
+            ic->ic_scan_rsn_last |= IEEE80211_RSNFAIL_MFP_REQ_US;
+        }
     }
     
     if (ic->ic_if.if_flags & IFF_DEBUG && ieee80211_debug) {
@@ -1326,10 +1379,30 @@ ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
     uint8_t min_5ghz_rssi;
     
     ni = RB_MIN(ieee80211_tree, &ic->ic_tree);
-    
+
+    /*
+     * Not upstream: record why this pass rejects what it rejects. See ieee80211com.
+     *
+     * Only sampled while a desired ESS is set. Passes run continuously — auto-join and background
+     * scans included — and one with no target rejects everything for the trivial reason that
+     * there is no target, so letting those overwrite the sample buries the pass that was actually
+     * trying to join. Last-write-wins across a mixed workload records the least interesting pass
+     * by construction; this keeps the last one that meant something.
+     */
+    int sampling = (ic->ic_des_esslen != 0);
+    if (sampling) {
+        ic->ic_scan_cand = 0;
+        ic->ic_scan_skipped = 0;
+        ic->ic_scan_fail_or = 0;
+        ic->ic_scan_fail_des = 0;
+        ic->ic_scan_rsn_des = 0;
+    }
+
     for (; ni != NULL; ni = nextbs) {
         nextbs = RB_NEXT(ieee80211_tree, &ic->ic_tree, ni);
         if (ni->ni_fails) {
+            if (sampling)
+                ic->ic_scan_skipped++;
             /*
              * The configuration of the access points may change
              * during my scan.  So delete the entry for the AP
@@ -1345,6 +1418,41 @@ ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
             *curbs = ni;
         
         int fail = ieee80211_match_bss(ic, ni, bgscan);
+        /*
+         * Not upstream. ic_scan_fail_des is the one that matters: a candidate carrying the ESSID
+         * we were told to join, rejected, names the rejection in a single ASSOCFAIL bit. The OR
+         * across the pass is the fallback for when the target is not in the cache at all — then
+         * ic_scan_cand says whether there was anything to reject in the first place.
+         */
+        if (sampling) {
+            ic->ic_scan_cand++;
+            ic->ic_scan_fail_or |= (u_int32_t)fail;
+            /*
+             * Prefer the candidate whose BSSID the join actually asked for. An ESS with more than
+             * one AP would otherwise leave whichever happened to be scanned last, and that one
+             * carries ASSOCFAIL_BSSID for the trivial reason that it is not the one we wanted —
+             * a bit that says nothing and hides the ones that do. 0x4000 marks the exact target.
+             */
+            int is_des_bssid = (ic->ic_flags & IEEE80211_F_DESBSSID) &&
+                               IEEE80211_ADDR_EQ(ic->ic_des_bssid, ni->ni_bssid);
+            if (is_des_bssid ||
+                (!(ic->ic_scan_fail_des & 0x4000) &&
+                 ni->ni_esslen == ic->ic_des_esslen &&
+                 memcmp(ni->ni_essid, ic->ic_des_essid, ic->ic_des_esslen) == 0)) {
+                ic->ic_scan_fail_des = (u_int32_t)fail | 0x8000 |
+                                       (is_des_bssid ? 0x4000 : 0);
+                ic->ic_scan_rsn_des = ic->ic_scan_rsn_last;
+                /* Both sides of the overlap: a zero intersection says nothing about which side. */
+                ic->ic_scan_ni_rsn = ((u_int32_t)ni->ni_rsnprotos << 16) |
+                                     (u_int16_t)ni->ni_rsnakms;
+                ic->ic_scan_ni_cipher = ((u_int32_t)ni->ni_rsnciphers << 16) |
+                                        (u_int16_t)ni->ni_rsngroupcipher;
+                ic->ic_scan_ic_rsn = ((u_int32_t)ic->ic_rsnprotos << 16) |
+                                     (u_int16_t)ic->ic_rsnakms;
+                ic->ic_scan_ic_cipher = ((u_int32_t)ic->ic_rsnciphers << 16) |
+                                        (u_int16_t)ic->ic_rsngroupcipher;
+            }
+        }
         if (fail != 0) {
             DPRINTF(("%s ieee80211_match_bss==FALSE, ssid=%s, bssid=%s, %d\n", __FUNCTION__, ni->ni_essid, ether_sprintf(ni->ni_bssid), fail));
             continue;

@@ -5,4 +5,18 @@ xcuserdata
 project.xcworkspace
 FwBinary.cpp
 *.pyc
+__pycache__
 MacKernelSDK
+
+# The ABI tooling's virtualenv (capstone). Recreated with
+#   python3 -m venv scripts/abi/.venv && scripts/abi/.venv/bin/pip install capstone
+# The tools themselves and tahoe-26.6-slots.txt are tracked; only the venv is not.
+scripts/abi/.venv
+
+# Archived kernel collections, kept so a release's layout stays disassemblable after
+# the OS that shipped it has been updated over. Tens of megabytes each and Apple's
+# binaries, so never committed — but do not delete them either: the text baselines
+# (scripts/abi/abi-*.txt) answer vtable questions only, and kdis/findfield/wclfsm/
+# slotcall all need the collection itself. The .sha256 beside each one is tracked.
+scripts/abi/kc/*.kc
+scripts/abi/kc/*.kc.elides

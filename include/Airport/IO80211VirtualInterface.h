@@ -4,7 +4,7 @@
 #include "IO80211Interface.h"
 #include "apple_private_spi.h"
 
-typedef UInt64 IO80211FlowQueueHash;
+#include "IO80211FlowQueueHash.h"
 typedef UInt kIO80211InterfaceType;
 class IO80211PeerManager;
 class RSNSupplicant;

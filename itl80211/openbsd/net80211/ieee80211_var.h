@@ -489,6 +489,56 @@ struct ieee80211com {
 	int16_t			ic_txpower;	/* tx power setting (dBm) */
 	int			ic_bmissthres;	/* beacon miss threshold */
 	int			ic_mgt_timer;	/* mgmt timeout */
+	/*
+	 * Divergence from OpenBSD, in the same style as ic_event_handler. net80211 tracks a beacon
+	 * miss *threshold* but never counts the beacons it receives, and AirportItlwm needs that
+	 * count: macOS' WCL tears a connection down after 60 s unless the driver keeps posting
+	 * message 39, whose only mandatory field is "beacons arrived since the last update".
+	 * Free-running; consumers take deltas. See include/Airport/LqmEventData.h.
+	 */
+	u_int32_t		ic_rx_beacons;	/* beacons rx'd from ic_bss since attach */
+	/*
+	 * Divergence from OpenBSD. Why the last ieee80211_node_choose_bss() pass selected nothing.
+	 * When a join stalls, net80211 stays in SCAN and every symptom above it — the WCL's join
+	 * timeout, our own deadline, "assoc status 0x22" — says only "it did not work". The reason
+	 * exists: match_bss returns an IEEE80211_NODE_ASSOCFAIL_* mask per candidate, which upstream
+	 * discards into a DPRINTF that has no sink on this platform. Kept so one boot names it.
+	 */
+	u_int32_t		ic_scan_cand;	 /* candidates that reached match_bss */
+	u_int32_t		ic_scan_skipped; /* candidates skipped first, on ni_fails */
+	u_int32_t		ic_scan_fail_or; /* OR of every match_bss mask in that pass */
+	u_int32_t		ic_scan_fail_des;/* mask for the last candidate matching ic_des_essid */
+	/*
+	 * Divergence from OpenBSD. Who clears the desired ESS, and from what state.
+	 * ieee80211_deselect_ess is the single choke point for ic_des_esslen = 0, and an ESS cleared
+	 * moments after a join programmed it kills that join with no diagnosable trace: every layer
+	 * above reports only that nothing was selected. The count is the total; the state is
+	 * ic_state at the most recent clear, which distinguishes the watchdog's give-up path (only
+	 * reachable from AUTH or ASSOC) from a caller that cleared it during SCAN.
+	 */
+	u_int32_t		ic_ess_clears;
+	u_int32_t		ic_ess_clear_state;
+	/*
+	 * Divergence from OpenBSD. Which RSN sub-check rejected the target, and both sides of the
+	 * comparison. ieee80211_match_bss folds eight independent tests into one
+	 * IEEE80211_NODE_ASSOCFAIL_WPA_PROTO bit, so that bit says only "the RSN parameters do not
+	 * overlap" — not which field, and not whose side is wrong. ic_scan_rsn_* is the breakdown,
+	 * written by match_bss for every candidate and latched by choose_bss for the target.
+	 */
+#define IEEE80211_RSNFAIL_PROTO		0x01	/* ni_rsnprotos & ic_rsnprotos == 0 */
+#define IEEE80211_RSNFAIL_AKM		0x02	/* ni_rsnakms & ic_rsnakms == 0 */
+#define IEEE80211_RSNFAIL_PSK		0x04	/* AP is PSK-only and IEEE80211_F_PSK is clear */
+#define IEEE80211_RSNFAIL_GROUP		0x08	/* ni_rsngroupcipher not one we support */
+#define IEEE80211_RSNFAIL_CIPHER	0x10	/* ni_rsnciphers & ic_rsnciphers == 0 */
+#define IEEE80211_RSNFAIL_IGTK		0x20	/* MFPC set and group mgmt cipher is not BIP */
+#define IEEE80211_RSNFAIL_MFP_REQ_AP	0x40	/* AP requires MFP, we lack IEEE80211_C_MFP */
+#define IEEE80211_RSNFAIL_MFP_REQ_US	0x80	/* we require MFP, AP does not advertise MFPC */
+	u_int32_t		ic_scan_rsn_last; /* breakdown for the most recent candidate */
+	u_int32_t		ic_scan_rsn_des;  /* breakdown latched for the target */
+	u_int32_t		ic_scan_ni_rsn;	  /* target: (ni_rsnprotos << 16) | ni_rsnakms */
+	u_int32_t		ic_scan_ni_cipher;/* target: (ni_rsnciphers << 16) | ni_rsngroupcipher */
+	u_int32_t		ic_scan_ic_rsn;	  /* ours:   (ic_rsnprotos << 16) | ic_rsnakms */
+	u_int32_t		ic_scan_ic_cipher;/* ours:   (ic_rsnciphers << 16) | ic_rsngroupcipher */
 #ifndef IEEE80211_STA_ONLY
 	CTimeout*		ic_inact_timeout; /* node inactivity timeout */
 	CTimeout*		ic_node_cache_timeout;
@@ -662,6 +712,21 @@ struct ieee80211_ess {
 #define IEEE80211_EVT_STA_DEAUTH                2
 #define IEEE80211_EVT_COUNTRY_CODE_UPDATE       3
 #define IEEE80211_EVT_SCAN_DONE                 4
+/* A beacon or probe response arrived while scanning. `data` is a
+ * struct ieee80211_beacon_event *, valid only for the duration of the call: the frame it points
+ * at is the receive mbuf's data, so a handler must copy anything it wants to keep.
+ * Raised only while scanning, because the only consumer is scan-result reporting and beacons
+ * arrive continuously once associated. Not upstream OpenBSD; this port's addition, alongside the
+ * other IEEE80211_EVT_* codes. */
+#define IEEE80211_EVT_SCAN_BEACON               5
+
+struct ieee80211_beacon_event {
+	const uint8_t	*frame;		/* start of the 802.11 management frame */
+	uint32_t	 len;		/* total frame length in bytes */
+	int		 rssi;		/* rxi_rssi, in the driver's units */
+	uint8_t		 chan;		/* rxi_chan, the channel it was received on */
+	int		 probe_resp;	/* 0 = beacon, 1 = probe response */
+};
 
 void	ieee80211_ifattach(struct _ifnet *, IOEthernetController *controller);
 void	ieee80211_ifdetach(struct _ifnet *);

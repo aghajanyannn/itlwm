@@ -18,6 +18,9 @@
 #include "IO80211InfraInterface.h"
 #include "IO80211InfraProtocol.h"
 #include "IOSkywalkPacketBufferPool.h"
+#if __IO80211_TARGET >= __MAC_26_0
+#include "IOSkywalkDataPath.h"
+#endif
 #include "IOSkywalkLegacyEthernetInterface.h"
 #include "IO80211SkywalkInterface.h"
 #else

@@ -95,6 +95,10 @@ const char * const ieee80211_phymode_name[] = {
 void ieee80211_set_beacon_miss_threshold(struct ieee80211com *);
 int ieee80211_newstate(struct ieee80211com *, enum ieee80211_state, int);
 
+/* TEMPORARY instrumentation (mechanism 9); see the assignment in ieee80211_newstate. */
+extern "C" uint32_t gItlwmLastStatePair;
+uint32_t gItlwmLastStatePair;
+
 void
 ieee80211_proto_attach(struct _ifnet *ifp)
 {
@@ -1418,6 +1422,32 @@ ieee80211_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
 		    ieee80211_state_name[ostate], ieee80211_state_name[nstate]);
 	ic->ic_state = nstate;			/* state transition */
 	ni = ic->ic_bss;			/* NB: no reference held */
+	/*
+	 * Local divergence from OpenBSD: do not drop the link on a transition that
+	 * re-enters RUN from RUN.
+	 *
+	 * Upstream drops it unconditionally here and relies on the RUN case below to
+	 * raise it again. That case only does so when RSN is off (or the AKM is
+	 * 802.1X); for an RSN network the link-up is deferred to ni_port_valid, which
+	 * ieee80211_recv_4way_msg3 / _recv_rsn_group_msg1 set exactly once, during the
+	 * handshake. So a later RUN -> RUN transition — a background scan ending on the
+	 * same BSS — drops the reported link state and nothing ever raises it again.
+	 *
+	 * That was nearly invisible while the only consumer was ifconfig's media status.
+	 * It is not invisible now: AirportItlwm forwards the link state to the Tahoe WCL
+	 * as message 216, and WCLNetManager answers a link-down indication by leaving the
+	 * network, so the association died ~57 ms after the handshake completed.
+	 */
+	/*
+	 * TEMPORARY instrumentation (mechanism 9). The transition currently being made,
+	 * packed (ostate << 16) | (nstate << 8) | mgt. AirportItlwm samples it in
+	 * setLinkStatus so a link-down can name the transition that caused it — which
+	 * nothing else can: XYLog has no sink on the target, and the WCL only ever sees
+	 * the resulting indication. Deducing the transition from ic_state alone was
+	 * ambiguous and wrong twice.
+	 */
+	gItlwmLastStatePair = ((uint32_t)ostate << 16) | ((uint32_t)nstate << 8) |
+	                      ((uint32_t)mgt & 0xff);
 	ieee80211_set_link_state(ic, LINK_STATE_DOWN);
 	ic->ic_xflags &= ~IEEE80211_F_TX_MGMT_ONLY;
 	switch (nstate) {
@@ -1715,7 +1745,29 @@ ieee80211_set_link_state(struct ieee80211com *ic, int nstate)
 {
 	struct _ifnet *ifp = &ic->ic_if;
     int link_state;
-    
+
+	/*
+	 * Local divergence from OpenBSD: never report the link down while the state
+	 * machine is in RUN.
+	 *
+	 * ieee80211_newstate drops the link at the top of *every* transition, before it
+	 * knows what the new state is, and relies on the RUN case to raise it again. That
+	 * case only raises it when RSN is off or the AKM is 802.1X; under RSN the link-up
+	 * is deferred to ni_port_valid, which the four-way and group handshakes set
+	 * exactly once. So the unconditional drop is bookkeeping, not information — and on
+	 * the ASSOC -> RUN transition that *completes* an association it is actively
+	 * false, because ic_state is already RUN when it fires.
+	 *
+	 * Measured: (ostate 3 ASSOC, nstate 4 RUN, mgt 0x10 ASSOC_RESP) was the transition
+	 * that reported the link down and made Tahoe's WCLNetManager leave the network 57
+	 * ms after a successful WPA2 join. In RUN there is an association by definition;
+	 * anything that really ends it leaves RUN first, and that transition still
+	 * reports.
+	 */
+	if (nstate != LINK_STATE_UP && ic->ic_state == IEEE80211_S_RUN)
+		return;
+
+
 	switch (ic->ic_opmode) {
 #ifndef IEEE80211_STA_ONLY
 	case IEEE80211_M_IBSS:

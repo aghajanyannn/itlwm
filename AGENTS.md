@@ -89,6 +89,9 @@ See `include/Airport/AGENTS.md` for how to recover a release's true layout.
 - `scripts/` — firmware packing, local load/unload helpers, and `scripts/abi/` vtable
   tooling for verifying the reconstructed headers against a shipping macOS release.
 - `itlwm.xcodeproj` — all targets. There is one project; never pass `-project`.
+- `scratch/` — gitignored, transient local files for a one-off task (captured logs,
+  ad hoc output) that don't belong anywhere else and aren't durable documentation.
+  Subfoldered by category, e.g. `scratch/logs/`. Never committed.
 
 ## Build Pipeline
 

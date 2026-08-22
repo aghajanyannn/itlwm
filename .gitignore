@@ -20,3 +20,9 @@ scripts/abi/.venv
 # slotcall all need the collection itself. The .sha256 beside each one is tracked.
 scripts/abi/kc/*.kc
 scripts/abi/kc/*.kc.elides
+
+# Transient local files needed for a one-off task but not durable documentation —
+# captured logs, ad hoc scratch output, etc. Subfoldered by category (e.g. logs/).
+# Never committed; make subfolders under here freely instead of dropping files at
+# the repo root or reusing a directory that has a real meaning elsewhere.
+scratch/

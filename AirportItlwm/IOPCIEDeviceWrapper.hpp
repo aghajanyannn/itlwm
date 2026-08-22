@@ -27,19 +27,10 @@ public:
     virtual IOReturn setPowerState(
         unsigned long powerStateOrdinal,
                                    IOService *   whatDevice ) override;
-#if defined(__IO80211_TARGET) && __IO80211_TARGET >= __MAC_26_0
-    // Tahoe bring-up: deferred registerService() for the -itldefer experiment.
-    static void publishLater(thread_call_param_t self, thread_call_param_t);
-#endif
-
+    
 public:
     ItlHalService *fHalService;
     IOPCIDevice *pciNub;
-#if defined(__IO80211_TARGET) && __IO80211_TARGET >= __MAC_26_0
-    // Must be a member: an armed thread_call has to be cancellable from stop(). Held as a
-    // stack local it could not be, which left registerService() firing on a freed object.
-    thread_call_t fPublishCall;
-#endif
 };
 
 #endif /* IOPCIEDeviceWrapper_hpp */

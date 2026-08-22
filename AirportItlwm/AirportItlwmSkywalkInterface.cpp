@@ -18,7 +18,6 @@
 OSDefineMetaClassAndStructors(AirportItlwmSkywalkInterface, IO80211InfraProtocol);
 
 #if __IO80211_TARGET >= __MAC_26_0
-extern "C" void ItlwmTrace(uint32_t id, const void *ra);
 
 // Two RegistrationInfo buffers are mandatory here, and they are different structs.
 // IOSkywalkNetworkInterface::prepareBSDInterface, with no null check anywhere:
@@ -46,40 +45,25 @@ extern "C" void ItlwmTrace(uint32_t id, const void *ra);
 // info->[4] >= 0x130, which is exactly what initRegistrationInfo writes. No pool, queue or
 // logical link needed.
 //
-// NETWORK SIDE — still lent from a static, because nothing allocates it short of
-// registerNetworkInterface, which needs a logical link, which needs a queue set, which needs
-// real IOSkywalkPacketQueue objects. That is a Skywalk data path this driver does not have:
-// its traffic runs through the legacy IOEthernetInterface instead.
+// NETWORK SIDE — allocated by registerNetworkInterface, which this driver now genuinely reaches:
+// it needs a logical link, which needs a queue set, which needs real IOSkywalkPacketQueue objects,
+// and buildSkywalkDataPath() builds exactly those (root AGENTS.md mechanism 1).
 //
-// Do not hand-allocate the lent one. Apple frees these with IOFreeType from early.kalloc.288,
-// a zone no kext can allocate into — IOMalloc lands in kalloc.type.var4.*, IOMallocData in
-// data.kalloc.*, and "early" is a boot-ordering property, not a type property. An earlier
-// attempt to own the buffer panicked on the free. The free(), stop() and deregisterLogicalLink()
-// overrides below take the static back first, which covers every reachable free path — see the
-// caller scan documented at reclaimLentRegistrationInfo().
+// Both fields are therefore non-NULL by the time prepareBSDInterface runs, and this override only
+// has to cover the ethernet side's allocator call. It used to lend kext statics for both when the
+// fields came up NULL; that stopgap was measured never to fire on 26.6.2 —
+// `ItlwmRegInfoLentNet = 0` and `ItlwmRegInfoLentEth = 0` with `ItlwmSkywalkStage = 11` — and was
+// deleted with its two counters, its MTU-offset poke, and the reclaim hooks that free(), stop()
+// and deregisterLogicalLink() used to carry.
 //
-// The loan is permanent, not scoped to this call — handing it back at the end of
-// prepareBSDInterface would just move the fault into those ioctl handlers.
-//
-// Whoever retires this loan must also retire the hand-rolled work-queue gating below: both are
-// here for the same reason — no real registration, so no Apple caller — and leaving one without
-// the other leaves a recursive no-op behind. Root AGENTS.md mechanisms 1 and 12.
-//
-// Apple's own fixup would substitute an MTU of 0x5dc if the ifnet MTU came out zero, but
-// stamping a real one keeps ifnet_set_mtu from failing at all, which is what gates the block
-// that marks the interface ready.
-#define ITLWM_REGINFO_MTU_OFFSET 0x4c
-static struct {
-    uint8_t bytes[sizeof(IOSkywalkNetworkInterface::RegistrationInfo)];
-} gItlwmLentNetRegInfo;
-static struct {
-    uint8_t bytes[sizeof(IOSkywalkEthernetInterface::RegistrationInfo)];
-} gItlwmLentEthRegInfo;
+// DO NOT hand-allocate either field if one ever comes up NULL again. Apple frees them with
+// IOFreeType from early.kalloc.288, a zone no kext can allocate into — IOMalloc lands in
+// kalloc.type.var4.*, IOMallocData in data.kalloc.*, and "early" is a boot-ordering property, not
+// a type property. An earlier attempt to own the buffer panicked on the free.
 
 bool AirportItlwmSkywalkInterface::
 prepareBSDInterface(ifnet_t ifp, UInt flags)
 {
-    ItlwmTrace(11, __builtin_return_address(0));
     if (mExpansionData == NULL || mExpansionData2 == NULL)
         return gatedSuperPrepareBSDInterface(ifp, flags);
 
@@ -92,61 +76,12 @@ prepareBSDInterface(ifnet_t ifp, UInt flags)
         initRegistrationInfo(&info, 1, sizeof(info));
         copyRegistrationInfo(&info);
     }
-    if (mExpansionData2->fRegistrationInfo == NULL) {
-        // copyRegistrationInfo refused. Lending still beats the guaranteed NULL deref, at the
-        // cost of the free hazard described above.
-        initRegistrationInfo((IOSkywalkEthernetInterface::RegistrationInfo *)
-                             &gItlwmLentEthRegInfo, 1, sizeof(gItlwmLentEthRegInfo));
-        mExpansionData2->fRegistrationInfo =
-            (IOSkywalkEthernetInterface::RegistrationInfo *)&gItlwmLentEthRegInfo;
-    }
-
-    // Network side: no equivalent exists. Only registerNetworkInterface allocates this one,
-    // and it requires a logical link, which requires a queue set, which requires real
-    // IOSkywalkPacketQueue objects — a data path this driver does not have. So it stays lent.
-    if (mExpansionData->fRegistrationInfo == NULL) {
-        *(uint32_t *)&gItlwmLentNetRegInfo.bytes[ITLWM_REGINFO_MTU_OFFSET] = ETHERMTU;
-        mExpansionData->fRegistrationInfo =
-            (IOSkywalkNetworkInterface::RegistrationInfo *)&gItlwmLentNetRegInfo;
-    }
-
     return gatedSuperPrepareBSDInterface(ifp, flags);
-}
-
-// Take the loan back. Identity-checked, so an Apple-allocated buffer is left alone and still
-// gets freed normally — only our own statics are unhooked.
-//
-// This must run before every path that frees the field. Scanning the kernel collection for
-// direct calls to IOSkywalkNetworkInterface::deregisterNetworkInterface finds exactly four,
-// and they resolve to three reachable entry points, all virtual:
-//
-//   IOSkywalkNetworkInterface::free          -> overridden below
-//   IOSkywalkNetworkInterface::stop          -> overridden below
-//   IOSkywalkNetworkInterface::deregisterLogicalLink (tail jmp) -> overridden below
-//   IOSkywalkEthernetInterface::deregisterEthernetInterface     -> not reachable for us
-//
-// The fourth is not virtual, but its only callers are registerEthernetInterface — which this
-// driver never calls — and AppleEthernetRL::stopInterface, another driver entirely. The
-// ethernet buffer is freed inline by IOSkywalkEthernetInterface::free rather than through
-// deregisterEthernetInterface, and free() is overridden, so it is covered too.
-//
-// Rerun that scan if this ever moves to a new macOS release: it is what makes teardown safe,
-// and a new caller would turn every unload into a zone panic.
-void AirportItlwmSkywalkInterface::
-reclaimLentRegistrationInfo()
-{
-    if (mExpansionData != NULL &&
-        (void *)mExpansionData->fRegistrationInfo == (void *)&gItlwmLentNetRegInfo)
-        mExpansionData->fRegistrationInfo = NULL;
-    if (mExpansionData2 != NULL &&
-        (void *)mExpansionData2->fRegistrationInfo == (void *)&gItlwmLentEthRegInfo)
-        mExpansionData2->fRegistrationInfo = NULL;
 }
 
 void AirportItlwmSkywalkInterface::
 free()
 {
-    reclaimLentRegistrationInfo();
     teardownSkywalkDataPath();
     super::free();
 }
@@ -154,7 +89,6 @@ free()
 void AirportItlwmSkywalkInterface::
 stop(IOService *provider)
 {
-    reclaimLentRegistrationInfo();
     teardownSkywalkDataPath();
     super::stop(provider);
 }
@@ -162,7 +96,11 @@ stop(IOService *provider)
 IOReturn AirportItlwmSkywalkInterface::
 deregisterLogicalLink(void)
 {
-    reclaimLentRegistrationInfo();
+    // Nothing to do here any more — this existed to take the RegistrationInfo loan back, and the
+    // loan is gone. Kept as a deliberate slot pin rather than deleted: an inherited slot is a hole
+    // the kext loader fills at load time and can fill wrong, and define-and-forward leaves no hole
+    // (see the vtable-hole contract in AirportItlwm/AGENTS.md). Costs one forwarding call on a
+    // teardown path.
     return super::deregisterLogicalLink();
 }
 
@@ -182,7 +120,6 @@ deregisterLogicalLink(void)
 // data path rather than at construction.
 // =================================================================================================
 extern "C" {
-uint32_t gItlwmSkywalkEnabled;
 uint32_t gItlwmSkywalkStage;        // how far buildSkywalkDataPath/registerSkywalkInterface got
 uint32_t gItlwmSkywalkRegRet;       // registerInfraEthernetInterface's IOReturn
 uint32_t gItlwmSkywalkTxDequeue;    // callback hit counters. TX is implemented, so TxDequeue is
@@ -491,10 +428,10 @@ registerSkywalkInterface()
     // getInterfaceSubFamily() which reads that same field, so it stays 0 = WIRED. Measured:
     // the first boot on this path published en2 with `type: Ethernet`.
     //
-    // Setting it here beats AirportItlwmEthernetInterface::forceWiFiSubfamily's raw poke at
-    // ifnet+0x22c: this is the documented Skywalk route Apple's own drivers take, it is a
-    // struct field rather than a release-specific ifnet offset, and it is applied before the
-    // ifnet is created instead of patched afterwards.
+    // This replaced a raw poke at ifnet+0x22c after the fact (root AGENTS.md mechanism 10, now
+    // closed): the documented Skywalk route Apple's own drivers take, a struct field rather than
+    // a release-specific ifnet offset, and applied before the ifnet is created instead of
+    // patched afterwards.
     *(uint32_t *)((uint8_t *)&info + ITLWM_REGINFO_SUBFAMILY_OFFSET) =
         ITLWM_REGINFO_SUBFAMILY_WIFI;
 
@@ -982,40 +919,7 @@ rxCompletionEnqueue(OSObject *, IOSkywalkRxCompletionQueue *, IOSkywalkPacket **
     return 0;
 }
 
-// BOTH event-pipe entry points dereference state[0xa8] unchecked, with identical prologues.
-// IO80211SkywalkInterface::createEventPipe:
-//
-//     mov rax, [rdi + 0x120]    ; Apple's per-interface state
-//     mov rdi, [rax + 0xa8]     ; the event source it publishes on
-//     mov rax, [rdi]            ; <-- faults on CR2 = 0 when that field is NULL
-//     call qword ptr [rax + 0x130]
-//
-// and ::destroyEventPipe, byte for byte the same load at +0x14/+0x1b and the same fault at
-// +0x22. Guarding only the create half is worse than guarding neither in one respect: it makes
-// the machine survive long enough for macOS to adopt the interface, and then `airportd` — not
-// just `wifip2pd` — calls destroy via IO80211APIUserClient::externalMethod ->
-// destroyEventPipeGated, which panics. Observed exactly that way once adoption started working.
-//
-// state[0xa8] is written in exactly one place, IO80211SkywalkInterface::start, and nulled in
-// ::free. Any client that opens an IO80211APIUserClient reaches these, so if start left the
-// field unset the first such client takes the machine down.
-//
-// Offsets are from disassembly, not a header. Refuse rather than let Apple fault: a client that
-// cannot get an event pipe loses AWDL/P2P, which beats a panic, and the counters say whether
-// this is being hit at all. Both halves must stay guarded together — see mechanism 2 in the
-// root AGENTS.md for the real fix.
-#define ITLWM_SKYIF_STATE_OFFSET  0x120
-#define ITLWM_SKYIF_EVTSRC_OFFSET 0xa8
-
 extern "C" {
-uint32_t gItlwmSkyIfStarted;
-uint32_t gItlwmSkyIfHasState;
-uint32_t gItlwmSkyIfHasEvtSrc;
-uint32_t gItlwmSkyIfLadder;
-uint32_t gItlwmEventPipeCalls;
-uint32_t gItlwmEventPipeRefused;
-uint32_t gItlwmEventPipeDestroys;
-uint32_t gItlwmEventPipeDestroysRefused;
 // Non-zero means prepareBSDInterface ran with no work queue to close the gate on, which leaves
 // Apple's sendIOUCToWcl free to panic. Expected to stay 0.
 uint32_t gItlwmPrepareBSDUngated;
@@ -1229,59 +1133,17 @@ setLinkLayerAddress(ether_addr *addr)
     return super::setLinkLayerAddress(addr);
 }
 
-// Progress ladder through IO80211SkywalkInterface::start, which returns false for us
-// (ItlwmSkyIfStarted = 0) and has twelve separate jumps to one failure label — so "which gate"
-// is not answerable by reading the disassembly alone. It does, however, store each object it
-// builds into state[] as it goes, in a fixed order. Sampling those after super::start() returns
-// turns the highest bit set into a position in the function, localising the failure to the range
-// between two rungs. Offsets recovered from 26.6 (25G72); re-derive with
+// super::start() is IO80211SkywalkInterface::start, which builds the per-interface state block
+// the whole family dereferences unchecked. Its return is propagated verbatim, and
+// AirportItlwmV2::start treats false as fatal — see the comment there. If it ever starts failing
+// again, it has twelve separate jumps to one failure label, so localise it by sampling the
+// objects it stores into state[] as it goes:
 //   scripts/abi/disrange.py __ZN23IO80211SkywalkInterface5startEP9IOService 0 760
 // and look for `mov qword ptr [<state> + 0xNN]`.
-static const uint16_t kItlwmSkyIfLadder[] = {
-    0x30,   // +0xad   provider safeMetaCast'd to IO80211Controller
-    0x38,   // +0xe3   controller->getWorkQueue()          (slot 397)
-    0x80,   // +0x26f
-    0x78,   // +0x31c
-    0x28,   // +0x395  the "started" marker; entry at +0x26 panics if this is already non-NULL
-    0xc8,   // +0x460
-    0x18,   // +0x482
-    0xa8,   // +0x54d  the event source — what mechanism 2's guards exist for
-    0xd8,   // +0x573
-    0x50,   // +0x59e  last object built before the tail
-};
-
-static uint32_t itlwmSkyIfLadderMask(const void *self)
-{
-    const uint8_t *st = *(const uint8_t *const *)
-        ((const uint8_t *)self + ITLWM_SKYIF_STATE_OFFSET);
-    if (st == NULL)
-        return 0;
-    uint32_t mask = 0;
-    for (unsigned i = 0; i < sizeof(kItlwmSkyIfLadder) / sizeof(kItlwmSkyIfLadder[0]); i++) {
-        if (*(void *const *)(st + kItlwmSkyIfLadder[i]) != NULL)
-            mask |= (1u << i);
-    }
-    return mask;
-}
-
-static void *itlwmSkyIfEvtSrc(const void *self)
-{
-    const uint8_t *st = *(const uint8_t *const *)
-        ((const uint8_t *)self + ITLWM_SKYIF_STATE_OFFSET);
-    if (st == NULL)
-        return NULL;
-    return *(void *const *)(st + ITLWM_SKYIF_EVTSRC_OFFSET);
-}
-
 bool AirportItlwmSkywalkInterface::
 start(IOService *provider)
 {
     bool ret = super::start(provider);
-    gItlwmSkyIfStarted = ret ? 1 : 0;
-    gItlwmSkyIfHasState =
-        (*(void *const *)((uint8_t *)this + ITLWM_SKYIF_STATE_OFFSET) != NULL);
-    gItlwmSkyIfHasEvtSrc = (itlwmSkyIfEvtSrc(this) != NULL);
-    gItlwmSkyIfLadder = itlwmSkyIfLadderMask(this);
 
     // Real Skywalk registration (mechanism 1). Unconditional on Tahoe — see the note at
     // ITLWM_REGINFO_MAC_OFFSET for why the three staging boot-args are gone. After super::start(),
@@ -1291,35 +1153,11 @@ start(IOService *provider)
     // answers Apple80211 and still drives the HAL, so a half-built data path is better diagnosed
     // from a running machine than turned into a failed start with nothing to read.
     // ItlwmSkywalkStage says how far it got; 11 is complete.
-    gItlwmSkywalkEnabled = 3;
     if (ret)
         registerSkywalkInterface();
     return ret;
 }
 
-UInt64 AirportItlwmSkywalkInterface::
-createEventPipe(IO80211APIUserClient *client)
-{
-    gItlwmEventPipeCalls++;
-    if (itlwmSkyIfEvtSrc(this) == NULL) {
-        gItlwmEventPipeRefused++;
-        return kIOReturnNoResources;
-    }
-    return super::createEventPipe(client);
-}
-
-void AirportItlwmSkywalkInterface::
-destroyEventPipe(IO80211APIUserClient *client)
-{
-    gItlwmEventPipeDestroys++;
-    if (itlwmSkyIfEvtSrc(this) == NULL) {
-        // Nothing was ever created — createEventPipe refused for the same reason — so there is
-        // nothing to tear down and returning is the whole correct behaviour.
-        gItlwmEventPipeDestroysRefused++;
-        return;
-    }
-    super::destroyEventPipe(client);
-}
 #endif
 
 const char* hexdump(uint8_t *buf, size_t len) {
@@ -1583,17 +1421,34 @@ void AirportItlwmSkywalkInterface::setGTK(const u_int8_t *gtk, size_t key_len, u
 
 #if __IO80211_TARGET >= __MAC_26_0
 bool AirportItlwmSkywalkInterface::
-init(IOService *provider, ether_addr *)
+init(IOService *provider, ether_addr *initMac)
 #else
 bool AirportItlwmSkywalkInterface::
 init(IOService *provider)
 #endif
 {
+    // IO80211InfraInterface::init() is the right base call and NOT interchangeable with
+    // IO80211SkywalkInterface::init(IOService *, ether_addr *): the Infra one chains through the
+    // zero-argument Skywalk init (which is what runs initIvars) and then allocates the Infra
+    // expansion block at this+0x128 — the block registerInfraEthernetInterface's MAC-stamp guard
+    // reads. The two-argument Skywalk init allocates no such block. So the base call stays, and
+    // the one thing it does not do is seeded explicitly below.
     bool ret = IO80211InfraInterface::init();
     if (!ret) {
         XYLog("%s IO80211InfraInterface init failed\n", __PRETTY_FUNCTION__);
         return false;
     }
+#if __IO80211_TARGET >= __MAC_26_0
+    // The ether_addr argument used to be discarded here, which made the whole caller-side seed in
+    // AirportItlwmV2::start a no-op: state[0xe4] stayed zero, IO80211SkywalkInterface::start
+    // handed that zero to IO80211MacAddressAgent::withOptions, and the agent minted a random
+    // locally-administered address. Nothing fails — the interface comes up and can even complete
+    // DHCP, because setLinkLayerAddress syncs whatever address the agent chose into net80211 —
+    // so the only visible tell is en3 carrying a different MAC every boot instead of the card's.
+    // Root AGENTS.md mechanism 21.
+    if (initMac != NULL)
+        setInitMacAddress(*initMac);
+#endif
     instance = OSDynamicCast(AirportItlwm, provider);
     if (!instance)
         return false;

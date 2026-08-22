@@ -69,12 +69,6 @@ public:
 
     virtual IOService * getProvider( void ) const override;
 
-#if __IO80211_TARGET >= __MAC_26_0
-    // Bring-up probe: stamp IFNET_SUBFAMILY_WIFI onto our ifnet so it reports a Wi-Fi
-    // functional type. Not virtual, not an override — see the derivation at the definition.
-    void forceWiFiSubfamily(ifnet_t ifp);
-#endif
-
 private:
     IO80211SkywalkInterface *interface;
     bool isAttach;

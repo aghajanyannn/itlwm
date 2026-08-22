@@ -95,6 +95,11 @@ Build-time and developer-machine helpers. Nothing here ships inside a kext.
     `SystemKernelExtensions.kc` is deliberately **not** archived — every `IO80211*`,
     `IOSkywalk*` and `AppleBCMWLAN*` class lives in the boot collection.
     Copy the collection before installing an update, not after: it is replaced wholesale.
+    **This was missed once already**: the machine reached 26.6.2 (25G83) with only 25G72 and 25G76
+    archived, so `$ITLWM_KC` had been defaulting to an unarchived kernel and every ABI check in the
+    repo was last made against a release the machine no longer runs. 25G83 is archived now and its
+    verification record is in the root `AGENTS.md`. The tell is cheap and worth making a habit:
+    `sw_vers` against `ls scripts/abi/kc/`.
 
   - `callcheck.sh` + `callprobe.cpp` — verify the vtable indices of classes the driver **calls
     virtuals on but never subclasses**: `IOSkywalkMemorySegment` and `IOSkywalkPacketQueue`

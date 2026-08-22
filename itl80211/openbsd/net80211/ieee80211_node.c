@@ -410,11 +410,10 @@ ieee80211_add_ess(struct ieee80211com *ic, struct ieee80211_join *join)
         if (ess == NULL)
             return (ENOMEM);
         /*
-         * Not upstream, because upstream passes M_ZERO and this port's malloc shim ignores its
-         * flags. Only essid/esslen are assigned below; everything else — flags, the RSN
-         * parameters, the PSK — is then read-modify-written from uninitialised heap.
+         * No memset here: this port's malloc shim (itl80211/openbsd/sys/_malloc.h) bzeros
+         * every allocation unconditionally, so it is strictly stronger than upstream's
+         * M_ZERO rather than weaker. One used to sit here on the opposite belief.
          */
-        memset(ess, 0, sizeof(*ess));
         memcpy(ess->essid, join->i_nwid, join->i_len);
         ess->esslen = join->i_len;
     }

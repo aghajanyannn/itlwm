@@ -677,6 +677,61 @@ struct apple80211_status_msg_hdr
 #define APPLE80211_M_AWDL_APP_SPECIFIC_INFO  144
 #define APPLE80211_M_WSEC_NOTIFICATION       146
 
+// Tahoe's WCL scan-manager completion event. Not in any SDK and deliberately named by this port:
+// recovered from AppleBCMWLANScanAdapter::scanComplete+0x55, which posts it with a 4-byte status
+// and the async flag. It is what drives SCAN_MANAGER_EVENT_SCAN_COMPLETE and moves the WCL FSM
+// out of SCAN_MANAGER_STATE_IN_PROGRESS. APPLE80211_M_SCAN_DONE (10) is a *different* audience —
+// AppleBCMWLANCore::scanComplete sends that one to userspace — so a driver owes both.
+// Deliberately left out of the APPLE80211_M_MAX / M_BUFF_SIZE bitmap below, which is Apple's
+// pre-Tahoe subscription map and must keep its original size.
+#define APPLE80211_M_WCL_SCAN_COMPLETE       237
+
+// Tahoe's WCL join-manager events, same category as APPLE80211_M_WCL_SCAN_COMPLETE above and named
+// by this port for the same reason. Recovered from WCLJoinManager's subscription table
+// (scripts/abi/wclfsm.py WCLJoinManager), which lists them as msgType 2 — messages a driver posts.
+//
+// Each handler sets msg[0x28], then requires a non-NULL payload *and* an exact length, and only then
+// raises the FSM event. **A wrong length raises no event at all** and returns kIOReturnError, which
+// is indistinguishable from never having posted the message — so the lengths below are part of the
+// contract, not documentation.
+//
+//   211  apple80211_assoc_event                (0x1c bytes)  -> JOIN_MANAGER_EVENT_JOIN_ASSOC_COMPLETE
+//   213  apple80211_connection_complete_event  (0xa4 bytes)  -> JOIN_MANAGER_EVENT_JOIN_CONNECT_COMPLETE
+//
+// JOIN_MANAGER_EVENT_JOIN_COMPLETE is *not* driver-posted: WCLJoinManager::handleJoinConnectComplete
+// raises it itself after isJoinProcessDone(). As with the scan path, APPLE80211_M_ASSOC_DONE (9) is a
+// different audience (userspace), so a driver owes both it and these.
+//
+// Kept out of the APPLE80211_M_MAX / M_BUFF_SIZE bitmap below for the same reason as 237.
+#define APPLE80211_M_WCL_AUTH_ASSOC_COMPLETE 211
+#define APPLE80211_M_WCL_FIRST_BEACON        212
+#define APPLE80211_M_WCL_CONNECT_COMPLETE    213
+#define APPLE80211_M_WCL_JOIN_ABORT_COMPLETE 214
+
+// 216 belongs to a *different* FSM and is owed on the same join. WCLNetManager subscribes to it as
+// its only link message (`wclfsm.py WCLNetManager`), and WCLNetManager::linkStatusInd raises
+// NET_MANAGER_EVENT_LINK_UP when payload byte 6 is non-zero and NET_MANAGER_EVENT_LINK_DOWN_IND
+// when it is zero. Nothing else moves that FSM out of NET_MANAGER_STATE_LINK_DOWN — CONNECT_COMPLETE
+// is `ignore` there — so a join that posts only 211 and 213 completes the JOIN_MANAGER FSM while
+// the interface stays link-down to the rest of the system: `ifconfig` reports `status: inactive`
+// and `networksetup -getairportnetwork` reports no association. **216 must precede 213**, because
+// LINK_DOWN + CONNECT_COMPLETE is a no-op while WAITING_FOR_CONNECT_COMPLETE + CONNECT_COMPLETE
+// advances to WAITING_FOR_IP; the same ordering rule as 211 before 213, for a different FSM.
+//
+//   216  apple80211_link_status_ind            (0x10 bytes)  -> NET_MANAGER_EVENT_LINK_{UP,DOWN_IND}
+#define APPLE80211_M_WCL_LINK_STATUS_IND     216
+
+// 39 is what keeps a completed connection alive. WCLNetManager::assocTimerAction runs every 5 s and
+// calls handleMissedBeacons() once **two** elapsed-time values both exceed 60001 ms; that escalates
+// to leaveNetworkCommand(..., 9, ...) and the WCL abandons the network. Both of those timestamps are
+// written by exactly one function — WCLNetManager::handleLqmUpdate, the sole subscriber of message
+// 39 — so a driver that never posts it holds a link for 60 s and no longer.
+//
+//   39  apple80211_lqm_event_data            (0x1dc bytes)  -> refreshes the missed-beacon timers
+//
+// Producer is AppleBCMWLANCore::postLQMEvent, which passes exactly 0x1dc and async=true. The length
+// is checked (`cmp qword ptr [rsi+8], 0x1dc; jne out`), so a wrong size is silently discarded.
+#define APPLE80211_M_LQM_UPDATE              39
 
 #define APPLE80211_M_MAX                     170
 #define APPLE80211_M_BUFF_SIZE               APPLE80211_MAP_SIZE( APPLE80211_M_MAX )

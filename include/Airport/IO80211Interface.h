@@ -29,7 +29,7 @@ typedef UInt kIO80211InterfaceType;
 	*/
 #define kIO80211InterfaceClass     "IO80211Interface"
 
-typedef UInt64 IO80211FlowQueueHash;
+#include "IO80211FlowQueueHash.h"
 class RSNSupplicant;
 class IOTimerEventSource;
 class IOGatedOutputQueue;

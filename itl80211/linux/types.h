@@ -110,6 +110,13 @@
 
 #define BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
 
+// Do NOT mirror this into another sink without strong justification. An attempt to capture
+// the HAL log for Tahoe bring-up by also calling a vsnprintf-based collector here made the
+// machine unbootable, non-deterministically and well before the HAL itself ran. XYLog is
+// called from every context in the driver, thousands of times, including interrupt
+// context; kprintf is a no-op on a machine with no serial sink, so any collector added
+// here is doing real work that has never run before, on every one of those call sites.
+// See include/Airport/AGENTS.md for what to do instead.
 #define XYLog(fmt, x...)\
 do\
 {\

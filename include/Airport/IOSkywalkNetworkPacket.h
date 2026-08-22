@@ -6,8 +6,11 @@
 //  Copyright © 2023 钟先耀. All rights reserved.
 //
 
-#ifndef IOSkywalkInterface_h
-#define IOSkywalkInterface_h
+// NOTE: this file's include guard was a copy of IOSkywalkInterface.h's. Including both would have
+// silently dropped whichever came second — a header that vanishes rather than conflicts. Nothing
+// includes this file today, which is why it never surfaced.
+#ifndef IOSkywalkNetworkPacket_h
+#define IOSkywalkNetworkPacket_h
 
 class IOSkywalkPacketBufferPool;
 class IOSkywalkPacketDescriptor;
@@ -51,4 +54,4 @@ public:
     uint8_t filter[0x78];
 };
 
-#endif /* IOSkywalkInterface_h */
+#endif /* IOSkywalkNetworkPacket_h */

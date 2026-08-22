@@ -13,6 +13,19 @@
 
 class CCTimestamp;
 class CCPipeStatistics;
+// CCLogPipe::initWithOwnerNameCapacity validates these fields and returns false — so
+// CCPipe::withOwnerNameCapacity returns NULL — before allocating anything, when any of:
+//
+//   HIGHER32(pipe_type)      >= 2      cmp dword [opts + 0x04], 2 ; jae fail
+//   LOWER32(log_data_type)   >= 7      cmp dword [opts + 0x08], 7 ; jge fail
+//   HIGHER32(log_data_type)  >= 2      cmp dword [opts + 0x0c], 2 ; jae fail
+//   min_log_size_notify > pipe_size    cmp [opts+0x18], [opts+0x10] ; ja fail
+//
+// (macOS 26.6/25G72, __ZN9CCLogPipe25initWithOwnerNameCapacity... @ 0xffffff80032f62c0.)
+// The last one couples two fields callers tend to set independently: shrinking pipe_size
+// without shrinking min_log_size_notify silently kills the pipe. A rejected pipe is not a
+// visible failure — the driver's start() just returns false and the machine boots without
+// Wi-Fi, which is easy to misread as success. See AirportItlwmV2.cpp ITLWM_CC_NOTIFY.
 struct CCPipeOptions {
     uint64_t pipe_type;  // 0x0
     uint64_t log_data_type;  // 0x8

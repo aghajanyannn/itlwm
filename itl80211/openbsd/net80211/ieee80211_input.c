@@ -3458,15 +3458,80 @@ ieee80211_recv_action(struct ieee80211com *ic, mbuf_t m,
     }
 }
 
+/*
+ * Hand a scan-time beacon or probe response to the driver, so AirportItlwm can push it to
+ * IO80211Family as a scan result. Tahoe has no getSCAN_RESULT for a driver to answer; results
+ * must be pushed. See include/Airport/BeaconMetaData.h.
+ *
+ * Gated on scanning on purpose: once associated, beacons arrive continuously from every AP in
+ * range, and the only consumer is scan reporting. Nothing is copied here — the handler gets a
+ * pointer into the receive mbuf and must copy what it needs.
+ *
+ * Not upstream OpenBSD. Kept in the same style as the other ic_event_handler call sites in this
+ * file so the divergence is one recognisable pattern rather than two.
+ */
+static void
+ieee80211_notify_scan_beacon(struct ieee80211com *ic, mbuf_t m,
+                             struct ieee80211_rxinfo *rxi, int probe_resp)
+{
+    struct ieee80211_beacon_event ev;
+
+    if (ic->ic_event_handler == NULL || rxi == NULL || m == NULL)
+        return;
+    if (ic->ic_state != IEEE80211_S_SCAN && !(ic->ic_flags & IEEE80211_F_BGSCAN))
+        return;
+    if (mbuf_len(m) < sizeof(struct ieee80211_frame))
+        return;
+
+    ev.frame = (const uint8_t *)mbuf_data(m);
+    ev.len = (uint32_t)mbuf_len(m);
+    ev.rssi = rxi->rxi_rssi;
+    ev.chan = rxi->rxi_chan;
+    ev.probe_resp = probe_resp;
+    (*ic->ic_event_handler)(ic, IEEE80211_EVT_SCAN_BEACON, &ev);
+}
+
+/*
+ * Count beacons from the AP we are associated to. Deliberately *not* the same predicate as
+ * ieee80211_notify_scan_beacon above: that one wants every AP in range while scanning, this one
+ * wants one AP while associated, so the two are mutually exclusive by design.
+ *
+ * The BSSID match matters. AirportItlwm reports this count to macOS as proof the link is alive
+ * (include/Airport/LqmEventData.h); counting a neighbour's beacons would keep a dead connection
+ * looking healthy, which is the exact failure the count exists to prevent.
+ *
+ * Not upstream OpenBSD.
+ */
+static void
+ieee80211_count_bss_beacon(struct ieee80211com *ic, mbuf_t m)
+{
+    const struct ieee80211_frame *wh;
+
+    if (ic->ic_state != IEEE80211_S_RUN || ic->ic_bss == NULL)
+        return;
+    if (m == NULL || mbuf_len(m) < sizeof(*wh))
+        return;
+
+    wh = (const struct ieee80211_frame *)mbuf_data(m);
+    /* i_addr3 is the BSSID in a beacon from an infrastructure AP. */
+    if (!IEEE80211_ADDR_EQ(wh->i_addr3, ic->ic_bss->ni_bssid))
+        return;
+
+    ic->ic_rx_beacons++;
+}
+
 void
 ieee80211_recv_mgmt(struct ieee80211com *ic, mbuf_t m,
                     struct ieee80211_node *ni, struct ieee80211_rxinfo *rxi, int subtype)
 {
     switch (subtype) {
         case IEEE80211_FC0_SUBTYPE_BEACON:
+            ieee80211_notify_scan_beacon(ic, m, rxi, 0);
+            ieee80211_count_bss_beacon(ic, m);
             ieee80211_recv_probe_resp(ic, m, ni, rxi, 0);
             break;
         case IEEE80211_FC0_SUBTYPE_PROBE_RESP:
+            ieee80211_notify_scan_beacon(ic, m, rxi, 1);
             ieee80211_recv_probe_resp(ic, m, ni, rxi, 1);
             break;
 #ifndef IEEE80211_STA_ONLY

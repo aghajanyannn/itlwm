@@ -124,6 +124,201 @@
 #define super ItlHalService
 OSDefineMetaClassAndStructors(ItlIwx, ItlHalService)
 
+#if defined(__IO80211_TARGET) && __IO80211_TARGET >= __MAC_26_0
+// Tahoe bring-up only. attach() fails inside iwx_preinit, and the exit it takes returns
+// without logging anything — XYLog is invisible on the target machine anyway (kprintf has
+// no sink there, and reaches neither dmesg nor the unified log). So record progress as
+// plain integers. AirportItlwm publishes them on its provider:
+//
+//     ioreg -n IOPCIEDeviceWrapper -l -w0 | grep ItlwmPreinit
+//
+// Deliberately only integer stores: no formatting, no allocation, no locking, and no new
+// work on any hot path. A previous attempt to capture this by mirroring every XYLog call
+// site through a vsnprintf collector made the machine unbootable.
+//
+// ItlwmPreinitMark — which exit of iwx_preinit was taken:
+//   1 entered   2 iwx_prepare_card_hw failed   3 already attached (early return)
+//   4 iwx_start_hw failed   5 past start_hw   6 iwx_run_init_mvm_ucode failed (silent)
+//   7 succeeded
+//
+// Measured: mark 6, errno 35 (EWOULDBLOCK). That pair proves the firmware DID come alive —
+// every tsleep between marks 5 and 6 needs sc_uc.uc_ok == 1, and a genuinely dead firmware
+// returns EINVAL (22) at "if (!sc->sc_uc.uc_ok) return EINVAL". So a later wait expired.
+//
+// ItlwmInitMark — which exit of iwx_run_init_mvm_ucode was taken (mark 6 only):
+//   1 RFKILL       2 iwx_load_ucode_wait_alive failed   3 INIT_EXTENDED_CFG_CMD failed
+//   4 NVM_ACCESS_COMPLETE failed                        5 INIT_COMPLETE tsleep expired
+//   6 iwx_nvm_get failed                                7 succeeded
+//
+// ItlwmPreSleepInitComplete — sc_init_complete sampled immediately BEFORE the wait. The
+// upstream loop re-tests the condition each iteration; this port replaced it with a single
+// unconditional tsleep_nsec, so a notification that lands before we sleep is consumed by
+// nobody and the sleep runs the full 2 s and returns EWOULDBLOCK. A non-zero value here
+// with ItlwmInitMark == 5 is that lost-wakeup race, and the fix is to restore the loop.
+//
+// Everything else is sampled by ITLWM_PREINIT_SNAP, which must run BEFORE iwx_stop_device.
+// iwx_stop_device calls iwx_reset_tx_ring for every queue, and that zeroes cur/queued/tail,
+// so reading the rings from the softc afterwards reports zeros no matter what happened.
+// An earlier version of this file read them live in publishPreinitMark and produced exactly
+// that false reading. Sample at the failure point, publish later.
+//
+// A finer version of this, tagging each of the five tsleep sites, was written and reverted
+// once: the kext hung on ~15 consecutive boots. That predates the deferred publish in
+// IOPCIEDeviceWrapper, which is what actually made Tahoe boot reliably, so the regression
+// was almost certainly the early-boot problem rather than these stores. Re-added with
+// itldefer in place.
+//
+// Deliberately only integer stores: no formatting, no allocation, no locking.
+// Remove with the rest of the bring-up instrumentation.
+extern "C" {
+// sizeof(struct ieee80211com) as the HAL sees it. Compared against net80211's own view; see the
+// assignment in iwx_attach for the panic this exists to catch.
+uint32_t gItlwmIcSizeHal;
+int gItlwmPreinitMark;
+int gItlwmPreinitErr;
+int gItlwmInitMark;
+int gItlwmInitErr;
+uint32_t gItlwmPreSleepInitComplete;
+uint32_t gItlwmSnapInitComplete;
+uint32_t gItlwmSnapUcOk;
+uint32_t gItlwmSnapUcIntr;
+uint32_t gItlwmSnapCmdCur;
+uint32_t gItlwmSnapCmdQueued;
+uint32_t gItlwmSnapGeneration;
+uint32_t gItlwmSnapSkuId0;
+uint32_t gItlwmSnapSkuId1;
+uint32_t gItlwmSnapSkuId2;
+// Command-path tracing. ItlwmInitMark 3 says the first host command timed out with the
+// firmware already alive; these say which half of that is broken. Read together:
+//   IsrCount == 0 after ALIVE       -> no interrupts are reaching us at all
+//   IsrCount > 0, NotifCount == 0   -> interrupts fire but nothing is dequeued from the RX ring
+//   NotifCount > 0, CmdDoneCount 0  -> the RX path works; no response was routed to the
+//                                      command queue (wrong qid, or the firmware never
+//                                      processed the command we kicked)
+// CmdDoorbell is the exact value written to IWX_HBUS_TARG_WRPTR (qid << 16 | cur), so a
+// wrong queue id or a stale write pointer is visible directly.
+uint32_t gItlwmCmdQid;
+uint32_t gItlwmCmdDoorbell;
+uint32_t gItlwmCmdDoneCount;
+uint32_t gItlwmCmdDoneLast;
+uint32_t gItlwmNotifIntrCount;
+uint32_t gItlwmIsrCount;
+// The counters above are cumulative across firmware load, which generates many DMA
+// interrupts of its own, so totals cannot say what happened after the command was kicked.
+// These latch the totals at the doorbell write; the difference is what matters:
+//   IsrCount - IsrAtKick == 0   -> the device went silent; the firmware never reacted
+//   difference > 0, Notif same  -> interrupts continued but none carried an RX cause
+//   Notif advanced, CmdDone 0   -> a notification arrived and was not a command response
+uint32_t gItlwmIsrAtKick;
+uint32_t gItlwmNotifAtKick;
+// ICT desync. iwx_intr's ICT path reads ict[ict_cur] and, on zero, leaves without touching
+// IWX_CSR_INT — so if the hardware ICT write pointer and ict_cur have drifted apart, every
+// interrupt is dropped while the hardware still reports a cause. That is indistinguishable
+// from "the firmware went silent" in the counters above: IsrCount keeps climbing and
+// NotifIntrCount never moves.
+//   IctZeroCount ~= IsrCount - IsrAtKick          -> every post-kick interrupt read zero
+//   IctZeroInt / IctZeroFh non-zero               -> DEFINITIVE desync: the hardware has a
+//                                                    cause pending that the ICT never showed
+//   IctZeroInt == IctZeroFh == 0                  -> genuinely spurious; ICT is in sync
+// The Acc fields OR every sample together, because Last alone can read zero on the final
+// interrupt while an earlier one carried the cause.
+uint32_t gItlwmIctZeroCount;
+uint32_t gItlwmIctZeroCur;
+uint32_t gItlwmIctZeroInt;
+uint32_t gItlwmIctZeroFh;
+uint32_t gItlwmIctZeroIntAcc;
+uint32_t gItlwmIctZeroFhAcc;
+// iwx_ict_reset is reached only from iwx_post_alive, i.e. it should run exactly once
+// between the ALIVE notification and the first host command. IctResetAtKick is that counter
+// latched at the doorbell:
+//   IctResetAtKick == 0 -> the reset had NOT run when the command was kicked; ICT was still
+//                          carrying whatever state firmware load left in it
+//   IctResetAtKick >= 1 -> the table and ict_cur were rezeroed first, so a desync after that
+//                          point is the hardware write pointer, not a stale index
+// IctResetAtIsr is IsrCount at the reset, so ISRs between reset and kick = IsrAtKick - it.
+uint32_t gItlwmIctResetCount;
+uint32_t gItlwmIctResetAtIsr;
+uint32_t gItlwmIctResetAtKick;
+// Sampled in iwx_post_alive once ICT has been left off. IctResetCount == 0 confirms the
+// binary running is the one that stopped enabling it.
+//   IctPaddrLo & 0xfff != 0 -> root cause of the dead table: CSR_DRAM_INT_TBL_REG carries
+//                              paddr >> IWX_ICT_PADDR_SHIFT, so a misaligned IOVA is
+//                              truncated and the hardware writes a different page. No other
+//                              DMA structure shifts its address, which is why only ICT broke.
+//   IctTblReg & 0x80000000  -> CSR_DRAM_INT_TBL_ENABLE still set; causes would still be
+//                              routed to DRAM and IWX_CSR_INT would stay 0.
+uint32_t gItlwmIctPaddrLo;
+uint32_t gItlwmIctTblReg;
+}
+#define ITLWM_PREINIT_MARK(n, e) \
+    do { gItlwmPreinitMark = (n); gItlwmPreinitErr = (e); } while (0)
+#define ITLWM_INIT_MARK(n, e) \
+    do { gItlwmInitMark = (n); gItlwmInitErr = (e); } while (0)
+#define ITLWM_PRESLEEP_SNAP(sc) \
+    do { gItlwmPreSleepInitComplete = (uint32_t)(sc)->sc_init_complete; } while (0)
+#define ITLWM_CMD_KICK(ring) do { \
+    gItlwmCmdQid = (uint32_t)(ring)->qid; \
+    gItlwmCmdDoorbell = (uint32_t)((ring)->qid << 16 | (ring)->cur); \
+    gItlwmIsrAtKick = gItlwmIsrCount; \
+    gItlwmNotifAtKick = gItlwmNotifIntrCount; \
+    gItlwmIctResetAtKick = gItlwmIctResetCount; \
+} while (0)
+// Two MMIO reads on the spurious-interrupt path. Deliberate: the whole point is what the
+// hardware believes is pending at the instant the ICT slot reads zero, and it cannot be
+// recovered later — iwx_intr returns without acknowledging, so the next entry sees a
+// different state. The non-ICT branch of this same function reads both registers on every
+// interrupt, so neither access is novel.
+#define ITLWM_ICT_ZERO(sc) do { \
+    uint32_t _r1 = IWX_READ((sc), IWX_CSR_INT); \
+    uint32_t _r2 = IWX_READ((sc), IWX_CSR_FH_INT_STATUS); \
+    gItlwmIctZeroCount++; \
+    gItlwmIctZeroCur = (uint32_t)(sc)->ict_cur; \
+    gItlwmIctZeroInt = _r1; \
+    gItlwmIctZeroFh = _r2; \
+    gItlwmIctZeroIntAcc |= _r1; \
+    gItlwmIctZeroFhAcc |= _r2; \
+} while (0)
+#define ITLWM_ICT_RESET() do { \
+    gItlwmIctResetCount++; \
+    gItlwmIctResetAtIsr = gItlwmIsrCount; \
+} while (0)
+// iwx_post_alive runs once, so the MMIO read here is not on any repeated path.
+#define ITLWM_ICT_OFF(sc) do { \
+    gItlwmIctPaddrLo = (uint32_t)(sc)->ict_dma.paddr; \
+    gItlwmIctTblReg = IWX_READ((sc), IWX_CSR_DRAM_INT_TBL_REG); \
+} while (0)
+#define ITLWM_CMD_DONE(qid, code) do { \
+    gItlwmCmdDoneCount++; \
+    gItlwmCmdDoneLast = (uint32_t)(((qid) << 16) | ((code) & 0xffff)); \
+} while (0)
+#define ITLWM_NOTIF_INTR() do { gItlwmNotifIntrCount++; } while (0)
+#define ITLWM_ISR()        do { gItlwmIsrCount++; } while (0)
+#define ITLWM_PREINIT_SNAP(sc) do { \
+    gItlwmSnapInitComplete = (uint32_t)(sc)->sc_init_complete; \
+    gItlwmSnapUcOk        = (sc)->sc_uc.uc_ok ? 1 : 0; \
+    gItlwmSnapUcIntr      = (sc)->sc_uc.uc_intr ? 1 : 0; \
+    gItlwmSnapCmdCur      = (uint32_t)(sc)->txq[IWX_DQA_CMD_QUEUE].cur; \
+    gItlwmSnapCmdQueued   = (uint32_t)(sc)->txq[IWX_DQA_CMD_QUEUE].queued; \
+    gItlwmSnapGeneration  = (uint32_t)(sc)->sc_generation; \
+    gItlwmSnapSkuId0      = (uint32_t)(sc)->sku_id[0]; \
+    gItlwmSnapSkuId1      = (uint32_t)(sc)->sku_id[1]; \
+    gItlwmSnapSkuId2      = (uint32_t)(sc)->sku_id[2]; \
+} while (0)
+#else
+#define ITLWM_PREINIT_MARK(n, e) do { } while (0)
+#define ITLWM_INIT_MARK(n, e) do { } while (0)
+#define ITLWM_PRESLEEP_SNAP(sc) do { } while (0)
+#define ITLWM_PREINIT_SNAP(sc) do { } while (0)
+#define ITLWM_CMD_KICK(ring) do { } while (0)
+#define ITLWM_CMD_DONE(qid, code) do { } while (0)
+#define ITLWM_NOTIF_INTR() do { } while (0)
+#define ITLWM_ISR() do { } while (0)
+#define ITLWM_ICT_ZERO(sc) do { } while (0)
+#define ITLWM_ICT_RESET() do { } while (0)
+#define ITLWM_ICT_OFF(sc) do { } while (0)
+#endif
+
+
 #define DEVNAME(_s)    ((_s)->sc_dev.dv_xname)
 
 #define IC2IFP(_ic_) (&(_ic_)->ic_if)
@@ -2832,8 +3027,10 @@ iwx_disable_interrupts(struct iwx_softc *sc)
 void ItlIwx::
 iwx_ict_reset(struct iwx_softc *sc)
 {
+    ITLWM_ICT_RESET();
+
     iwx_disable_interrupts(sc);
-    
+
     memset(sc->ict_dma.vaddr, 0, IWX_ICT_SIZE);
     sc->ict_cur = 0;
     
@@ -3516,10 +3713,25 @@ fail:
 void ItlIwx::
 iwx_post_alive(struct iwx_softc *sc)
 {
-    
     XYLog("%s\n", __FUNCTION__);
-    iwx_ict_reset(sc);
-    
+
+    // DIVERGENCE from iwm, which this HAL inherited the ICT path from: iwx_ict_reset(sc)
+    // used to run here. It is not called any more, on AX200 (pci8086,2723) under Tahoe.
+    //
+    // Measured: of the 205 interrupts taken during attach, the first 2 arrived before ICT
+    // was enabled and delivered IWX_ALIVE through the plain IWX_CSR_INT path. All 203 that
+    // followed read ict[0] == 0, with ict_cur never leaving slot 0 — the table received
+    // nothing from the very first interrupt after it was switched on, so there was never an
+    // index drift to resynchronise; the hardware simply does not write it. iwx_intr then
+    // leaves via out_ena, which calls iwx_restore_interrupts without writing IWX_CSR_INT,
+    // so the unacknowledged cause re-raises at once. That loop is the 203.
+    //
+    // Not enabling ICT keeps iwx_intr on the IWX_CSR_INT branch, which is the branch that
+    // demonstrably worked for the ALIVE that got us here.
+    iwx_disable_interrupts(sc);         /* also acknowledges every pending cause */
+    sc->sc_flags &= ~IWX_FLAG_USE_ICT;
+    ITLWM_ICT_OFF(sc);
+
     /*
      * Re-enable all the interrupts, including the RF-Kill one, now that
      * the firmware is alive.
@@ -4838,6 +5050,7 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
     if ((sc->sc_flags & IWX_FLAG_RFKILL) && !readnvm) {
         XYLog("%s: radio is disabled by hardware switch\n",
             DEVNAME(sc));
+        ITLWM_INIT_MARK(1, EPERM);
         return EPERM;
     }
 
@@ -4845,6 +5058,7 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
     err = iwx_load_ucode_wait_alive(sc);
     if (err) {
         XYLog("%s: failed to load init firmware\n", DEVNAME(sc));
+        ITLWM_INIT_MARK(2, err);
         return err;
     }
     
@@ -4857,13 +5071,17 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
      */
     err = iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_SYSTEM_GROUP,
                                            IWX_INIT_EXTENDED_CFG_CMD), IWX_CMD_SEND_IN_RFKILL, sizeof(init_cfg), &init_cfg);
-    if (err)
+    if (err) {
+        ITLWM_INIT_MARK(3, err);
         return err;
+    }
 
     err = iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_REGULATORY_AND_NVM_GROUP,
                                            IWX_NVM_ACCESS_COMPLETE), IWX_CMD_SEND_IN_RFKILL, sizeof(nvm_complete), &nvm_complete);
-    if (err)
+    if (err) {
+        ITLWM_INIT_MARK(4, err);
         return err;
+    }
 
     /* Wait for the init complete notification from the firmware. */
 //    while ((sc->sc_init_complete & wait_flags) != wait_flags) {
@@ -4872,8 +5090,13 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
 //        if (err)
 //            return err;
 //    }
+    // Sampled before the sleep: upstream re-tests the condition in a loop, this port does
+    // not, so a notification that already arrived leaves nothing to wake us. A non-zero
+    // value here together with ItlwmInitMark == 5 is a lost wakeup, not a dead firmware.
+    ITLWM_PRESLEEP_SNAP(sc);
     err = tsleep_nsec(&sc->sc_init_complete, 0, "iwxinit", SEC_TO_NSEC(2));
     if (err) {
+        ITLWM_INIT_MARK(5, err);
         return err;
     }
 
@@ -4881,13 +5104,15 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
         err = iwx_nvm_get(sc);
         if (err) {
             XYLog("%s: failed to read nvm\n", DEVNAME(sc));
+            ITLWM_INIT_MARK(6, err);
             return err;
         }
         if (IEEE80211_ADDR_EQ(etheranyaddr, sc->sc_ic.ic_myaddr))
             IEEE80211_ADDR_COPY(sc->sc_ic.ic_myaddr,
                 sc->sc_nvm.hw_addr);
-        
+
     }
+    ITLWM_INIT_MARK(7, 0);
     return 0;
 }
 
@@ -6420,8 +6645,9 @@ iwx_send_cmd(struct iwx_softc *sc, struct iwx_host_cmd *hcmd)
     DPRINTF(("%s: Sending command (%.2x.%.2x), %d bytes at [%d]:%d ver: %d\n", __func__, group_id, cmd->hdr.cmd, cmd->hdr_wide.length, cmd->hdr.idx, cmd->hdr.qid, cmd->hdr_wide.version));
     ring->queued++;
     ring->cur = (ring->cur + 1) % getTxQueueSize();
+    ITLWM_CMD_KICK(ring);
     IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR, ring->qid << 16 | ring->cur);
-    
+
     if (!async) {
         err = tsleep_nsec(desc, PCATCH, "iwxcmd", SEC_TO_NSEC(1));
         if (err == 0) {
@@ -6517,7 +6743,11 @@ iwx_cmd_done(struct iwx_softc *sc, int qid, int idx, int code)
 {
     struct iwx_tx_ring *ring = &sc->txq[IWX_DQA_CMD_QUEUE];
     struct iwx_tx_data *data;
-    
+
+    // Counted before the qid filter: a response arriving on the wrong queue is exactly the
+    // failure this is meant to catch, and the early return would hide it.
+    ITLWM_CMD_DONE(qid, code);
+
     if (qid != IWX_DQA_CMD_QUEUE) {
         return;    /* Not a command ack. */
     }
@@ -9732,10 +9962,18 @@ iwx_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
      * we are scanning in which case a SCAN -> SCAN transition
      * triggers another scan iteration. And AUTH -> AUTH is needed
      * to support band-steering.
+     *
+     * The `return 0` was missing from the day this guard was added (3e8da1c), while the OpenBSD
+     * change it cites has it. Without it the `if` had no statement of its own, so the RUN block
+     * below became its body — inverting *both* halves: same-state transitions were passed through
+     * to ieee80211_newstate instead of being dropped, and the A-MPDU/task teardown that 6dc344d
+     * added to keep the newstate thread from racing systq ran only when ns_nstate == nstate,
+     * i.e. almost never, and never on the RUN -> SCAN case its own comment describes.
      */
     if (sc->ns_nstate == nstate && nstate != IEEE80211_S_SCAN &&
         nstate != IEEE80211_S_AUTH)
-    
+        return 0;
+
     if (ic->ic_state == IEEE80211_S_RUN) {
         if (nstate == IEEE80211_S_SCAN) {
             /*
@@ -11240,7 +11478,9 @@ iwx_notif_intr(struct iwx_softc *sc)
 {
     struct mbuf_list ml = MBUF_LIST_INITIALIZER();
     uint16_t hw;
-    
+
+    ITLWM_NOTIF_INTR();
+
     //    bus_dmamap_sync(sc->sc_dmat, sc->rxq.stat_dma.map,
     //        0, sc->rxq.stat_dma.size, BUS_DMASYNC_POSTREAD);
     
@@ -11273,6 +11513,8 @@ iwx_intr(OSObject *object, IOInterruptEventSource* sender, int count)
     struct iwx_softc *sc = &that->com;
     int handled = 0;
     int r1, r2, rv = 0;
+
+    ITLWM_ISR();
     
 //    IWX_WRITE(&that->com, IWX_CSR_INT_MASK, 0);
     
@@ -11281,8 +11523,12 @@ iwx_intr(OSObject *object, IOInterruptEventSource* sender, int count)
         int tmp;
         
         tmp = htole32(ict[sc->ict_cur]);
-        if (!tmp)
+        if (!tmp) {
+            // Sampled before the return: this exit acknowledges nothing, so the hardware
+            // interrupt state at this instant is not observable anywhere else.
+            ITLWM_ICT_ZERO(sc);
             goto out_ena;
+        }
         
         /*
          * ok, there was something.  keep plowing until we have all.
@@ -12714,31 +12960,42 @@ iwx_preinit(struct iwx_softc *sc)
     struct _ifnet *ifp = IC2IFP(ic);
     int err;
     static int attached;
-    
+
+    ITLWM_PREINIT_MARK(1, 0);
     err = iwx_prepare_card_hw(sc);
     if (err) {
+        ITLWM_PREINIT_MARK(2, err);
         XYLog("%s: could not initialize hardware\n", DEVNAME(sc));
         return err;
     }
-    
+
     if (attached) {
         /* Update MAC in case the upper layers changed it. */
         IEEE80211_ADDR_COPY(sc->sc_ic.ic_myaddr,
                             ((struct arpcom *)ifp)->ac_enaddr);
+        ITLWM_PREINIT_MARK(3, 0);
         return 0;
     }
-    
+
     err = iwx_start_hw(sc);
     if (err) {
+        ITLWM_PREINIT_MARK(4, err);
         XYLog("%s: could not initialize hardware\n", DEVNAME(sc));
         return err;
     }
-    
+
+    ITLWM_PREINIT_MARK(5, 0);
     err = iwx_run_init_mvm_ucode(sc, 1);
+    // Before iwx_stop_device — it resets every tx ring, zeroing cur/queued/tail.
+    ITLWM_PREINIT_SNAP(sc);
     iwx_stop_device(sc);
-    if (err)
+    if (err) {
+        // The one exit with no log of its own — the reason this marker exists.
+        ITLWM_PREINIT_MARK(6, err);
         return err;
-    
+    }
+    ITLWM_PREINIT_MARK(7, 0);
+
     /* Print version info and MAC address on first successful fw load. */
     attached = 1;
     XYLog("%s: hw rev 0x%x, fw ver %s, address %s\n",
@@ -13037,6 +13294,21 @@ iwx_attach(struct iwx_softc *sc, struct pci_attach_args *pa)
     if (sc->sc_nswq == NULL)
         goto fail4;
     
+    /*
+     * struct ieee80211com as *this* translation unit sees it. net80211 publishes its own view
+     * (ieee80211_node_attach), and AirportItlwm compares the two.
+     *
+     * ieee80211com is the first member of iwx_softc and ic_ess is its last member, so a HAL object
+     * built against a stale copy of ieee80211_var.h writes its softc fields straight over the
+     * ESS list head. The result is a GP fault deep inside ieee80211_switch_ess with a pointer made
+     * of instruction bytes, which reads as a net80211 bug and is not one. The struct gains fields
+     * regularly during Tahoe bring-up, so the check earns its keep; delete it with the rest of the
+     * instrumentation.
+     */
+#if defined(__IO80211_TARGET) && __IO80211_TARGET >= __MAC_26_0
+    gItlwmIcSizeHal = (uint32_t)sizeof(struct ieee80211com);
+#endif
+
     ic->ic_phytype = IEEE80211_T_OFDM;    /* not only, but not used */
     ic->ic_opmode = IEEE80211_M_STA;    /* default to BSS mode */
     ic->ic_state = IEEE80211_S_INIT;

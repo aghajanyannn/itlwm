@@ -1423,22 +1423,6 @@ ieee80211_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
 	ic->ic_state = nstate;			/* state transition */
 	ni = ic->ic_bss;			/* NB: no reference held */
 	/*
-	 * Local divergence from OpenBSD: do not drop the link on a transition that
-	 * re-enters RUN from RUN.
-	 *
-	 * Upstream drops it unconditionally here and relies on the RUN case below to
-	 * raise it again. That case only does so when RSN is off (or the AKM is
-	 * 802.1X); for an RSN network the link-up is deferred to ni_port_valid, which
-	 * ieee80211_recv_4way_msg3 / _recv_rsn_group_msg1 set exactly once, during the
-	 * handshake. So a later RUN -> RUN transition — a background scan ending on the
-	 * same BSS — drops the reported link state and nothing ever raises it again.
-	 *
-	 * That was nearly invisible while the only consumer was ifconfig's media status.
-	 * It is not invisible now: AirportItlwm forwards the link state to the Tahoe WCL
-	 * as message 216, and WCLNetManager answers a link-down indication by leaving the
-	 * network, so the association died ~57 ms after the handshake completed.
-	 */
-	/*
 	 * TEMPORARY instrumentation (mechanism 9). The transition currently being made,
 	 * packed (ostate << 16) | (nstate << 8) | mgt. AirportItlwm samples it in
 	 * setLinkStatus so a link-down can name the transition that caused it — which

@@ -14,11 +14,21 @@ Sources for `AirportItlwm.kext`, the native Wi-Fi driver that subclasses Apple's
 - `AirportItlwmSkywalkInterface.cpp/.hpp` — the V2 Skywalk data-path interface,
   subclasses `IO80211InfraProtocol`. Carries the bulk of the `apple80211_*` accessors. Its
   `prepareBSDInterface` gets the ethernet `RegistrationInfo` allocated by Apple's own
-  `copyRegistrationInfo` and permanently lends a static for the network one; `free`, `stop`
-  and `deregisterLogicalLink` take the loan back so the family never frees kext memory. Its
-  `createEventPipe` **and** `destroyEventPipe` refuse when Apple's `state[0xa8]` event source is
-  NULL — both dereference it unchecked, with byte-identical prologues — and its `start` override
-  records why, in the `ItlwmSkyIf*` properties. Guard them as a pair; see the adoption section.
+  `copyRegistrationInfo`; the network one is allocated by `registerNetworkInterface`, which this
+  driver now genuinely reaches. It used to lend kext statics for both when the fields came up NULL
+  — that stopgap was measured never to fire on 26.6.2 (`ItlwmRegInfoLentNet`/`LentEth` both 0 with
+  `ItlwmSkywalkStage = 11`) and is deleted, along with `reclaimLentRegistrationInfo` and its hooks.
+  **Never hand-allocate either field:** Apple frees them with `IOFreeType` from `early.kalloc.288`,
+  a zone no kext can allocate into, and an earlier attempt panicked on the free.
+  Its `start` override is where the real Skywalk registration hangs off a successful
+  `super::start()`, and **its return is load-bearing**: `AirportItlwmV2::start` treats false as
+  fatal on Tahoe. That check replaced hand-written NULL guards on
+  `createEventPipe`/`destroyEventPipe` — both dereference Apple's `state[0xa8]` unchecked, and the
+  only way to reach a NULL there was to ignore `start()`'s return. Do not weaken it back to a bare
+  call without restoring the guards.
+  It also seeds the family's MAC agent: `init`'s `ether_addr *` is forwarded to
+  `IO80211SkywalkInterface::setInitMacAddress`, which it used to discard — see root AGENTS.md
+  mechanism 21.
   See `include/Airport/AGENTS.md`.
   It also carries the **real Skywalk registration** (root AGENTS.md mechanism 1), which on Tahoe is
   **unconditional and is the machine's only Wi-Fi data path**. `start` builds two
@@ -89,8 +99,8 @@ Sources for `AirportItlwm.kext`, the native Wi-Fi driver that subclasses Apple's
   emits are absent from the unified log under any predicate, measured on a registering boot,
   while the counters for the same code path read correctly. Grepping the log for `itlskywalk`
   matches the **boot-args** line, which contains the string — easy to mistake for driver output and
-  the reason this was believed to work. Whatever `itldefer` does for timing, it does not make
-  `IOLog` reach `log show` here.
+  the reason this was believed to work. Deferring the publish did not make `IOLog` reach
+  `log show` either, and that deferral is gone now regardless.
   Still add both: a counter must be wired into `publishRuntimeCounters` in the same edit that sets
   it, or it publishes nothing and the boot answers nothing — which is how a whole bring-up boot was
   wasted.
@@ -125,15 +135,24 @@ Sources for `AirportItlwm.kext`, the native Wi-Fi driver that subclasses Apple's
   matches the hardware and republishes it. Keep both personalities in step.
 - Code that differs by release is gated on `__IO80211_TARGET`, never on `#ifdef` of a
   target name.
-- **The deferred publish owns a cancellable handle.** `IOPCIEDeviceWrapper::start` arms a
-  `thread_call` for `registerService()`, so it must keep it in `fPublishCall`, `retain()` before
-  arming, `release()` at the end of `publishLater`, and in `stop()` cancel it — dropping the
-  reference only when `thread_call_cancel` returns TRUE — then `thread_call_free`. A
-  `thread_call` is not teardown-free just because it is not an `IOEventSource`: held as a stack
-  local with no retain it left `registerService()` running against a freed object for as long as
-  `itldefer`. Do the teardown in `stop()`, **not** in a `free()` override — `free` is one of the
-  slots the loader can mis-bind (see the vtable-hole contract below), so do not add another
-  same-named override to this kext.
+- **`IOResourceMatch` in a personality may be an OSString or an OSDictionary, and nothing else.**
+  `IOService::checkResource` walks the metaclass chain against exactly those two and otherwise logs
+  `<class>: Can't match using: <type>` and fails open — so a wrong type silently disables the gate
+  rather than refusing to match, taking any previously-working entry with it. All 61
+  `IOResourceMatch` entries in the 26.6.2 boot collection are `<string>`; an XML plist cannot
+  express an OSSet, so **one resource per personality is the hard limit**. The kernel's own
+  `('IOBSD', 'boot-uuid-media')` array is not a counter-example: it is a *matching dictionary* fed
+  to `waitForMatchingService`, parsed by `IOResources::matchPropertyTable`, a different consumer
+  with different type rules. Root AGENTS.md mechanism 7 has the full trace.
+- **`IOResourceMatch` in a personality may be an OSString or an OSDictionary, and nothing else.**
+  `IOService::checkResource` walks the metaclass chain against exactly those two and otherwise logs
+  `<class>: Can't match using: <type>` and **fails open** — so a wrong type silently disables the
+  gate rather than refusing to match, taking any previously-working entry with it. All 61
+  `IOResourceMatch` entries in the 26.6.2 boot collection are `<string>`; an XML plist cannot
+  express an OSSet, so **one resource per personality is the hard limit**. The kernel's own
+  `('IOBSD','boot-uuid-media')` array is not a counter-example: it is a *matching dictionary* fed
+  to `waitForMatchingService`, parsed by `IOResources::matchPropertyTable`, a different consumer
+  with different type rules. Tried, measured and reverted here — root AGENTS.md mechanism 7.
 - **Identity properties belong on the Skywalk interface, not the ethernet one.**
   `AirportItlwmEthernetInterface::attachToDataLinkLayer` owns the BSD ifnet, but the object
   userspace treats as the Wi-Fi device is `AirportItlwmSkywalkInterface`. Every property that
@@ -272,22 +291,28 @@ panicking. Two independent preconditions, both observed missing on Tahoe:
    `getInterfaceSubFamily()` is virtual; our ifnet comes from the legacy `IOEthernetInterface`,
    so that route stays closed until the registration is real.
 
-   `forceWiFiSubfamily` therefore writes the field directly, and **verifies before writing**:
-   the family word must read `IFNET_FAMILY_ETHERNET (2)`, otherwise the offsets do not describe
-   the running kernel and nothing is touched. Read the outcome without a rebuild:
+   **That route is now open, and the raw poke is GONE.** `forceWiFiSubfamily` used to write
+   `ifnet+0x22c` directly, guarded by a check that the family word read `IFNET_FAMILY_ETHERNET (2)`.
+   It is deleted along with `ITLWM_IFNET_FAMILY_OFFSET` / `ITLWM_IFNET_SUBFAMILY_OFFSET` and the
+   four `ItlwmIfnet*` properties (root AGENTS.md mechanism 10, closed). The replacement is
+   `RegistrationInfo + 0x0c`, seeded in `registerSkywalkInterface` before the ifnet exists — a
+   struct field rather than a release-pinned ifnet offset, and the route Apple's own drivers take.
+   The poke was additionally dead on Tahoe: its only caller,
+   `AirportItlwmEthernetInterface::attachToDataLinkLayer`, never runs there.
+
+   The table above stays because it is what *establishes* that no IONetworkingFamily API reaches
+   the field — that is the reason the Skywalk route is mandatory, and it has to be re-derived if
+   the interface ever reads `WIRED` again. Check it from userspace, no rebuild needed:
 
    ```bash
-   ioreg -r -c AirportItlwmEthernetInterface -l -w0 | grep ItlwmIfnet
    clang -O0 -o /tmp/ifpred scripts/ifpred.c && /tmp/ifpred en0 en3
+   ifconfig -v en3 | grep type:
    ```
 
-   `ItlwmIfnetSubfamilySet = 0` means the guard refused, i.e. re-derive the offsets.
-
-   **Measured on 26.6: the poke works and adoption then proceeds.** `ItlwmIfnetFamily 2`,
-   `SubfamilyWas 0`, `SubfamilyNow 3`, `SubfamilySet 1`; `ifpred` reports functional type 3 and
-   `ifconfig -v en3` flips from `type: Ethernet` to `type: Wi-Fi`. Two `Skywalk` agents plus an
+   **Measured on 26.6 with the RegistrationInfo route:** `ifpred` reports functional type 3
+   (`WIFI_INFRA`), `ifconfig -v en3` reads `type: Wi-Fi`, two `Skywalk` agents plus an
    `agent domain:WiFiManager type:CallInProgress desc:"WiFi"` attach to the ifnet, and `airportd`
-   starts driving `IO80211APIUserClient` — which it never did while the interface read `WIRED`.
+   drives `IO80211APIUserClient` — which it never did while the interface read `WIRED`.
    So functional type was a real gate. Whether `_getIfListCopy` now returns `ifCount[1]` is
    now **confirmed**: airportd fully adopts the interface. `networksetup
    -listpreferredwirelessnetworks en3` returns the stored network list, `-getairportpower en3`
@@ -295,12 +320,17 @@ panicking. Two independent preconditions, both observed missing on Tahoe:
    the firmware version, `Country Code: DE`, `Locale: ETSI` and the full 2.4/5 GHz channel list.
    Adoption is no longer a suspect for anything.
 
-3. **The event pipe must survive adoption.** Once `airportd` adopts the interface it calls
-   `IO80211APIUserClient::externalMethod` → `destroyEventPipe` → `destroyEventPipeGated` →
-   `IO80211SkywalkInterface::destroyEventPipe`, which faults at `+0x22` on the same
-   `state[0xa8]` NULL that `createEventPipe` does. Guarding only `create` converts a boot-time
-   panic into a panic ~90 s in, under `airportd`, as soon as adoption starts working. Both are
-   overridden now; `ItlwmEventPipeDestroys` / `ItlwmEventPipeDestroysRefused` count them.
+3. **The event pipe must survive adoption — no longer guarded here, guarded upstream of it.**
+   Once `airportd` adopts the interface it calls `IO80211APIUserClient::externalMethod` →
+   `destroyEventPipe` → `destroyEventPipeGated` → `IO80211SkywalkInterface::destroyEventPipe`,
+   which faults at `+0x22` on the same `state[0xa8]` NULL that `createEventPipe` does — so
+   guarding only `create` would convert a boot-time panic into a panic ~90 s in, under `airportd`,
+   as soon as adoption started working. That shape is still worth knowing.
+   Neither is overridden any more. `state[0xa8]` is NULL only when `IO80211SkywalkInterface::start`
+   half-failed, and `AirportItlwmV2::start` now treats that as fatal, so the state the guards
+   defended against cannot be reached. Two release-pinned offsets went with them.
+   **If that check is ever weakened back to a bare `fNetIf->start(this);`, restore both guards
+   together** — root AGENTS.md mechanism 2 carries the disassembly.
 
 4. **`prepareBSDInterface` must run with the interface work queue's gate closed.**
    `IO80211InfraInterface::prepareBSDInterface+0x112` → `updateStaticProperties` →
@@ -352,6 +382,14 @@ It is a worklog, kept in the order things were found, because each entry records
 release can re-set. **For where the port actually stands, read the last three sections** — the join
 FSM completes, and message 216 to `WCLNetManager` is the current unbooted change. What follows below
 is history from the point where scanning did not work.
+
+**Property names below that no longer exist.** The measurements are still true of the boots they
+record, but these counters have since been deleted with the mechanisms that needed them, so do not
+try to read them on a current build: `ItlwmSkyIfStarted` / `HasState` / `HasEvtSrc` / `Ladder`,
+`ItlwmEventPipe*`, `ItlwmIfnet*`, `ItlwmTraceCount`, `ItlwmGetProv*`, `ItlwmSkywalkEnabled`,
+`ItlwmSkipCC` / `MinCC` / `CCOwner` / `CCPipeKB` / `NoStart` / `NoHal`. Likewise the boot-args
+`-itlnocc`, `-itlmincc`, `-itlccowner`, `itlccsize`, `-itlnostart`, `-itlnohal`, `itlprovtrap`,
+`itlmarktrap`, `itlifnettrap`, `itlcmdtrap`.
 
 ### Where it started on Tahoe: the interface comes up and scanning fails
 
@@ -2702,9 +2740,9 @@ is written to disk. Don't spend time there without first arranging for a capture
 
 ### Diagnostics on a boot that panics
 
-**The panic string is the only channel.** `itldefer` delays `start()` ~30 s, by which time
-the GUI has replaced the verbose console, so XYLog has no reader — not the console, not
-dmesg, not the unified log. And a boot that panics never reaches `publishPreinitMark`, so no
+**The panic string is the only channel.** `start()` runs early in boot, before anything is
+reading the console reliably, so XYLog has no reader — not the console, not dmesg, not the
+unified log. And a boot that panics never reaches `publishPreinitMark`, so no
 ioreg property is ever written. The panic report is collected on the *next* boot, with the
 kext disabled, from macOS's "previous session crashed" dialog.
 
@@ -2716,9 +2754,11 @@ Two things to do with a report before reading anything into it:
 - **Bucket it by uptime against the whole corpus.** `System uptime in nanoseconds` plus the
   first kext frame, swept across `/Library/Logs/DiagnosticReports/*.panic`, separates boot
   phases that look alike in a single report. This driver's own failures cluster in the
-  `itldefer` + start window — 35–58 s at `itldefer=30` — with frames in `IO80211Family`,
-  `IOSkywalkFamily` or `IONetworkingFamily`. A panic at single-digit seconds is a different
-  phase and probably a different bug; do not attribute it to whatever changed last.
+  driver's own start window, with frames in `IO80211Family`, `IOSkywalkFamily` or
+  `IONetworkingFamily`. **That window moved when the deferral was deleted**: it used to be
+  35–58 s (at `itldefer=30`) and is now early boot, so the old "single-digit seconds means someone
+  else's bug" heuristic no longer holds. Re-derive the bucket from the current corpus before
+  attributing a report.
 - **Disassemble the faulting Apple frame.** `scripts/abi/disrange.py <symbol> <start> <end>`
   takes the `symbol + 0xNNN` straight from the backtrace, and `scripts/abi/findfield.py` names
   who writes the field it faulted on. That turns "NULL deref in Apple code" into a named
@@ -2744,63 +2784,40 @@ then dereferences the second unguarded — which Apple's own guard on the same f
 ~5.9 s on every boot, including boots that survive, so the trigger is routine and only the race
 is rare. Nothing in itlwm calls either function; the driver's own panics land at 35–58 s.
 
-`itldefer` itself is a stopgap: it waits a fixed number of seconds where it should wait on a
-precondition, and it is required on Tahoe rather than optional. Scheduled for investigation —
-see "Tahoe bring-up: temporary mechanisms" in the root AGENTS.md.
+**`itldefer` is gone** — measured, then deleted after `-itlnodefer` booted 5/5 (root AGENTS.md
+mechanism 7). `IOPCIEDeviceWrapper::start` publishes immediately again, so `AirportItlwm::start()`
+now runs early in boot rather than ~30 s in. That changes what the panic-uptime bucketing below is
+worth: this driver's own failures no longer cluster at 35–58 s, and a report at single-digit
+seconds is no longer automatically someone else's bug.
 
-### BSD-attach tracing (`__IO80211_TARGET >= __MAC_26_0` only)
+### BSD-attach tracing — REMOVED
 
-Events go into a 16-entry ring; a deliberate `panic()` delivers it, trading an uncontrolled
-fault for a controlled one that carries the evidence. Every mark records its own return
-address, so the ring names the **Apple** function that called into us.
+The 16-entry `ItlwmTrace` ring, `ItlwmMarkRef`, the KASLR-delta decoding recipe and all four
+boot-arg panic traps (`itlprovtrap`, `itlmarktrap`, `itlifnettrap`, `itlcmdtrap`) are deleted, with
+the raw `ifnet + 0x280` read and the hardcoded vtable indices 241/291 that went with them. The NX
+fault they existed to catch is root-caused: the kext loader bound slot 241 to
+`IO80211SkywalkInterface::errnoFromReturn` instead of `IOService::errnoFromReturn`, and it is now
+pinned by overriding 240/241 in `AirportItlwmEthernetInterface`. See `include/Airport/AGENTS.md`.
 
-Event ids: 1 `getProvider` (faked), 2 `attachToDataLinkLayer` entry,
-3 `detachFromDataLinkLayer`, 4 `setLinkState`, 5 `setHardwareAddress`, 6 `getHardwareAddress`,
-7 `getPacketFilters`, 8 `setPromiscuousMode`, 9 `setMulticastMode`, 10 `setMulticastList`,
-11 `prepareBSDInterface`, 12 `getFeatures`, 13 `selectMedium`, 14 `configureInterface`,
-15 `setLinkStatus`, 16 `attachToDataLinkLayer` **returned**, 17 an ioctl.
+**Two of the four defaulted to ARMED** — `itlprovtrap` to 1 and `itlmarktrap` to 5, not 0 — so a
+shipping kext carried two live `panic()` triggers. They never fired only because both need
+`attachToDataLinkLayer` to have run, and on Tahoe it never does. Nothing in the code or the docs
+said the default was armed.
+**Rule: a diagnostic whose default is "armed" is a landmine, not a diagnostic.** Disarmed must be
+what you get by typing nothing, and the removal date belongs in the edit that adds it.
 
-Four independent triggers, all boot-args, all disarmed with `0`:
+Findings worth keeping from that apparatus, now that it is gone:
 
-| arg | fires on |
-| --- | --- |
-| `itlprovtrap=<N>` | the Nth faked `getProvider` call (default 1) |
-| `itlmarktrap=<id>` | first event with id ≥ this, **after** event 16. Event 16 arms it and never trips it — arming on event 2 instead fires inside `super::attachToDataLinkLayer`, on the `getFeatures` that `getIfnetHardwareAssistValue` makes, which is a path that completes fine |
-| `itlifnettrap=1` | dumps the ifnet's `if_ioctl` (`[ifp+0x280]`) before the post-attach ioctl |
-| `itlcmdtrap=<N>` | the Nth **gated** ioctl, plus that interface's live vtable slots 241/291 |
-
-"Gated" matters: `IOEthernetInterface::performCommand` splits on
-`add rax, 0xffffffff7fdf96f4 ; cmp rax, 0x39 ; bt 0x201016000000011, rax`, and only that side
-reaches `executeCommand` → `performGatedCommand` → a `syncSIOC*` handler. It is exactly seven
-commands — `SIOCSIFADDR`, `SIOCSIFFLAGS`, `SIOCADDMULTI`, `SIOCDELMULTI`, `SIOCSIFMTU`,
-`SIOCSIFLLADDR`, `SIOCSIFCAP`. Counting *all* ioctls just catches configd's `SIOCGIFMEDIA`
-polling, which takes the other branch and cannot reach the handlers.
-
-A trap that never fires is a result. `itlmarktrap` armed on every id and staying silent is
-what proved Apple never enters our code during that ioctl.
-
-Return addresses are stored as a signed delta from `ItlwmMarkRef` so they survive KASLR, and
-printed as unsigned hex — a value near `0xffffffff` is negative, i.e. a caller *below* our
-kext, which means Apple's code. Decode:
-
-1. `R = <AirportItlwm base from the panic's kext list> + <nm offset of _ItlwmMarkRef>`.
-   Cross-check: the panic backtrace's own `_ItlwmTrace` address must equal `R + 0x10`.
-2. `ra = R + (int32)delta`.
-3. Inside our kext → `atos -o …dSYM/…/AirportItlwm -arch x86_64 -l <kext base> <ra>`.
-   Otherwise subtract the panic's `KernelCache slide` and look the address up in
-   `BootKernelExtensions.kc` with the `scripts/abi/` symbol table.
-
-```bash
-nm -m build/Release/Tahoe/AirportItlwm.kext/Contents/MacOS/AirportItlwm | grep _ItlwmMarkRef
-```
-
-Validate any decode against the ring's last entry, which is normally
-`attachNetworkInterfaceToBSD+0x9e` — if that one does not land exactly, the base is wrong.
-
-`getProvider` is a hot IOKit accessor: the traced path must stay a counter bump and one ring
-slot, with no logging or allocation. `panic`, `PE_parse_boot_argn` and `snprintf` resolve
-against `com.apple.kpi.mach` / `com.apple.kpi.libkern`, both already in `OSBundleLibraries`.
-Remove the whole apparatus once Tahoe bring-up is finished, along with the HAL markers.
+- **A trap that never fires is a result.** `itlmarktrap` armed on every id and staying silent is
+  what proved Apple never enters our code during the post-attach ioctl.
+- **Read a suspect vtable slot off the live object** — `((void *const *)*(void *const *)this)[N]`
+  from one of our own overrides, delivered in the `panic()` string. That is what identified the
+  loader mis-bind, and it is reusable without any of the deleted machinery.
+- **"Gated" ioctls are exactly seven.** `IOEthernetInterface::performCommand` splits on
+  `add rax, 0xffffffff7fdf96f4 ; cmp rax, 0x39 ; bt 0x201016000000011, rax`, and only that side
+  reaches `executeCommand` → `performGatedCommand` → a `syncSIOC*` handler: `SIOCSIFADDR`,
+  `SIOCSIFFLAGS`, `SIOCADDMULTI`, `SIOCDELMULTI`, `SIOCSIFMTU`, `SIOCSIFLLADDR`, `SIOCSIFCAP`.
+  configd's `SIOCGIFMEDIA` polling takes the other branch and cannot reach them.
 
 ## Verification
 

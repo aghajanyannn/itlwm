@@ -208,6 +208,21 @@ public:
     virtual bool init(IOService *);
 #endif
     virtual bool isInterfaceEnabled(void);
+
+#if __IO80211_TARGET >= __MAC_26_0
+    // NOT virtual and NOT in any vtable — an exported symbol only, so declaring it costs no
+    // slot (the declaration-only pattern in include/Airport/AGENTS.md; verified absent from
+    // every class table in scripts/abi/abi-26.6-25G72.txt).
+    //
+    // Three instructions on 26.6: state[0xe4] = *(u32 *)mac; state[0xe8] = *(u16 *)(mac+4).
+    // It is the SAME field that init(IOService *, ether_addr *) seeds, and that field is
+    // IO80211MacAddressAgent's initial address — IO80211SkywalkInterface::start hands
+    // state[0xe4] straight to IO80211MacAddressAgent::withOptions. Left at zero the agent mints
+    // a random locally-administered address instead, silently. Root AGENTS.md mechanism 21.
+    //
+    // Needs this+0x120 non-NULL, i.e. it must be called after a successful init().
+    void setInitMacAddress(ether_addr &);
+#endif
     virtual ether_addr *getSelfMacAddr(void);
 #if __IO80211_TARGET < __MAC_26_0
     virtual void setSelfMacAddr(ether_addr *);

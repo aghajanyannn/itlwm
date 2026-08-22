@@ -94,12 +94,12 @@ macOS kernel. Shared unchanged by `itlwm.kext` and `AirportItlwm.kext`.
 
 - When porting an OpenBSD change, keep the upstream function name, structure, and comments
   so a later diff against OpenBSD still lines up.
-- **`malloc()` in this port's shim ignores its flags, so `M_ZERO` does nothing.** Upstream
-  allocations that rely on it come back as uninitialised heap, and the surrounding code then
-  read-modify-writes fields it never assigned. `ieee80211_add_ess` had exactly this: only
-  `essid`/`esslen` were set, while `flags`, the RSN parameters and the PSK were inherited from
-  whatever occupied that memory before. `memset` explicitly after every `malloc` ported from
-  upstream.
+- **`malloc()` in this port's shim zeroes unconditionally, so `M_ZERO` is redundant, not absent.**
+  `itl80211/openbsd/sys/_malloc.h` ends every allocation with `bzero(buf, len)` whatever flags the
+  caller passed — strictly stronger than upstream's `M_ZERO`, not weaker. Do **not** add a `memset`
+  after a ported `malloc`; one was added to `ieee80211_add_ess` on the opposite belief and was dead
+  code. This entry previously asserted the opposite and blamed that function's corruption on
+  uninitialised heap; the real bug was the dangling-list `free` below, which is fixed independently.
 - **Freeing a structure that a list still points at is the same bug however upstream wrote it.**
   `ieee80211_add_ess`'s error paths freed `ess` unconditionally, but `ess` is the *existing* entry
   when the lookup above found one — still linked into `ic_ess`. The dangling pointer then killed
@@ -134,6 +134,10 @@ macOS kernel. Shared unchanged by `itlwm.kext` and `AirportItlwm.kext`.
   in `ieee80211_newstate` (too narrow — the real edge was `ASSOC -> RUN`), and filtering in
   `AirportItlwm::setLinkStatus` instead (leaves `if_link_state` stuck DOWN, so the *next* genuine
   disconnect is silently swallowed). The predicate belongs where `if_link_state` is owned.
+  A comment block describing the first of those attempts survived in `ieee80211_newstate`, directly
+  above the unconditional drop it claimed to have replaced, and has been deleted. **A comment that
+  describes a divergence must sit at the code that implements it**; left at the site of a reverted
+  attempt it reads as documentation of behaviour that is not there.
 - **A net80211 entry point the HAL also calls is not a free function.** Before calling any
   `ieee80211_*` from `AirportItlwm/` or `itlwm/`, grep the HALs for it: if a HAL calls it too,
   whatever the HAL does *around* the call is part of the contract. `ieee80211_end_scan` is the

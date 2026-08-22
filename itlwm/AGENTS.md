@@ -71,6 +71,20 @@ ioreg -r -n IOPCIEDeviceWrapper -l -w0 | grep -i itlwm
 immediately before the INIT_COMPLETE wait — non-zero there with `ItlwmInitMark == 5` is a
 lost wakeup rather than an absent notification.
 
+**These are published from two places now, and for years they were published from only one that
+could never fire on a working machine.** `publishPreinitMark` is called from exactly one site,
+inside the `if (!fHalService->attach(pciNub))` **failure** branch, so on every boot where the
+driver works none of these properties existed at all — while root AGENTS.md mechanisms 4 and 8
+both say "read this on one surviving boot", which was impossible by construction.
+`AirportItlwm::publishRuntimeCounters` now calls it too, on the `AirportItlwm` node:
+
+```bash
+ioreg -r -c AirportItlwm -l -w0 | grep -i itlwm      # the surviving-boot copy
+ioreg -r -n IOPCIEDeviceWrapper -l -w0 | grep -i itlwm   # the attach-failure copy
+```
+
+**Rule: a counter published only from an error path cannot answer a question about success.**
+
 Command-path counters localise a host command that is written to the ring and never
 acknowledged (`ItlwmInitMark == 3`). `ItlwmCmdDoneCount` is incremented in `iwx_cmd_done`
 **before** its `qid != IWX_DQA_CMD_QUEUE` early return, so a response delivered on the wrong
@@ -115,6 +129,20 @@ Remaining ICT markers, sampled once in `iwx_post_alive`:
 | --- | --- |
 | `IctResetCount == 0`, `IctZeroCount == 0` | ICT is off; `iwx_intr` is on the `IWX_CSR_INT` path |
 | `IctPaddrLo & 0xfff != 0` | root cause of the dead table — `CSR_DRAM_INT_TBL_REG` takes `paddr >> IWX_ICT_PADDR_SHIFT`, so a misaligned IOVA truncates to a different page. No other DMA structure shifts its address, which is why only ICT broke |
+
+**"Then just ask for 4096-byte alignment" is REFUTED — it already does.** `iwx_alloc_ict` passes
+`1 << IWX_ICT_PADDR_SHIFT` to `iwx_dma_contig_alloc`, byte-identical to `hal_iwm` and to OpenBSD's
+`iwm`. That value reaches only the 6-argument `IODMACommand::withSpecification`, whose alignment
+parameter lands in `fAlignMask`. XNU carries **three** alignment fields — `fAlignMask`,
+`fAlignMaskLength`, `fAlignMaskInternalSegments` — and only the `SegmentOptions` overload sets all
+three; the 6-argument factory leaves the other two at their defaults, so the request constrains the
+wrong one. Nothing then checks what comes back: the `>> IWX_ICT_PADDR_SHIFT` is unconditional.
+Read `ItlwmIctPaddrLo & 0xfff` on a surviving boot (now possible, see above) before touching the
+allocator.
+
+Note `iwx_ict_reset` has **no callers**, so `IWX_FLAG_USE_ICT` is never set: the nine
+`ItlwmIct{Zero,Reset}*` counters are provably 0 forever and only `IctPaddrLo` / `IctTblReg` carry
+information. They come out with mechanism 4, not before — that boot has not happened yet.
 | `IctTblReg & 0x80000000` | `CSR_DRAM_INT_TBL_ENABLE` still set in hardware; causes would go to DRAM and `IWX_CSR_INT` would read 0 |
 
 Everything else comes from `ITLWM_PREINIT_SNAP`, which **must stay ahead of

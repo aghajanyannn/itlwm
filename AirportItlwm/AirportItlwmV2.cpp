@@ -25,195 +25,6 @@ OSDefineMetaClassAndStructors(CTimeout, OSObject)
 IO80211WorkQueue *_fWorkloop;
 IOCommandGate *_fCommandGate;
 
-#if defined(__IO80211_TARGET) && __IO80211_TARGET >= __MAC_26_0
-// BSD-attach tracing. The NX panic in the post-attach ioctl calls a data address as code,
-// and the backtrace cannot name the call site: IOEthernetInterface::performGatedCommand
-// reaches every syncSIOC* handler by tail jmp, so none of them builds a stack frame. These
-// marks say which of our overrides the ioctl path actually reaches, and in what order.
-//
-// THE PANIC STRING IS THE ONLY CHANNEL. `itldefer` puts start() ~30 s in, long after the
-// GUI has replaced the verbose console, so XYLog has no reader at all; and a boot that
-// panics never reaches publishPreinitMark, so ioreg properties never appear. The panic
-// report is recovered on the *next* boot, with the kext disabled. So the trace is kept in a
-// ring and delivered by a deliberate panic() — trading the uncontrolled NX fault for a
-// controlled one that carries the evidence. Same cost in boots, far more information.
-//
-// Event ids:
-//   1 getProvider (faked)   2 attachToDataLinkLayer   3 detachFromDataLinkLayer
-//   4 setLinkState          5 setHardwareAddress      6 getHardwareAddress
-//   7 getPacketFilters      8 setPromiscuousMode      9 setMulticastMode
-//  10 setMulticastList     11 prepareBSDInterface    12 getFeatures
-//  13 selectMedium         14 configureInterface     15 setLinkStatus
-//  16 attachToDataLinkLayer returned  <- arms the trap; never trips it
-//
-// Every mark records its own return address, so the ring names the *Apple* function that
-// called into us — which is the thing the NX backtrace cannot supply, because
-// performGatedCommand tail-jmps into the syncSIOC* handlers and they build no frame.
-//
-// Two triggers, either of which delivers the ring:
-//   itlprovtrap=<N>  panic on the Nth faked getProvider call (default 1)
-//   itlmarktrap=<id> panic on the first event with id >= this that happens after
-//                    attachToDataLinkLayer RETURNS (event 16) — i.e. in the ifnet_ioctl.
-//                    Use 1 for maximum sensitivity: the very next thing of ours that the
-//                    ioctl touches. Set 0 to disarm. Event 16 never trips it.
-//
-// If neither fires, the original NX panic returns — and that is a result too: it means the
-// fault happens inside Apple's own dispatch without ever entering our code.
-#define ITLWM_TRACE_RING 16
-extern "C" {
-uint8_t  gItlwmTraceId[ITLWM_TRACE_RING];
-int32_t  gItlwmTraceRA[ITLWM_TRACE_RING];
-uint32_t gItlwmTraceCount;
-uint32_t gItlwmGetProvCount;
-uint32_t gItlwmGetProvFaked;
-static bool gItlwmAttachSeen;
-
-// Return addresses are stored as a delta from this symbol so they survive KASLR. Decode with
-//   nm -m build/Release/Tahoe/AirportItlwm.kext/Contents/MacOS/AirportItlwm | grep ItlwmMarkRef
-//   atos -o build/Release/Tahoe/AirportItlwm.kext.dSYM/Contents/Resources/DWARF/AirportItlwm \
-//        -arch x86_64 -l 0 <that address + delta>
-// A delta that lands outside our kext is an Apple caller: add it to the runtime address of
-// ItlwmMarkRef instead, then map it with the kext list in the panic report.
-__attribute__((noinline, used)) void ItlwmMarkRef(void) { asm volatile ("" ::: "memory"); }
-
-__attribute__((noinline)) static void ItlwmTraceTrap(const char *why, uint32_t id,
-                                                     const void *ra)
-{
-    char buf[640];
-    int off = snprintf(buf, sizeof(buf),
-                       "ITLWM %s trap: id=%u ra=+0x%lx getprov=%u/%u events=%u ring=",
-                       why, id, (long)((long)ra - (long)&ItlwmMarkRef),
-                       gItlwmGetProvFaked, gItlwmGetProvCount, gItlwmTraceCount);
-    uint32_t first = gItlwmTraceCount > ITLWM_TRACE_RING
-                   ? gItlwmTraceCount - ITLWM_TRACE_RING : 0;
-    for (uint32_t i = first; i < gItlwmTraceCount && off > 0 && off < (int)sizeof(buf) - 24; i++) {
-        uint32_t s = i % ITLWM_TRACE_RING;
-        off += snprintf(buf + off, sizeof(buf) - off, "[%u:%x]",
-                        gItlwmTraceId[s], (unsigned)gItlwmTraceRA[s]);
-    }
-    panic("%s", buf);
-}
-
-// The ioctl that follows attachToDataLinkLayer dispatches through the ifnet's own callback
-// table: ifnet_ioctl does `mov rax,[ifp+0x280]; test rax,rax; je; call rax`. That pointer is
-// the last piece of state between our attach and the NX fault, and it is not observable from
-// inside the driver any other way — Apple never calls into us during that ioctl (proven: the
-// mark trap, armed on every id, never fires). So dump it before the ioctl runs.
-//
-// itlifnettrap=1 arms this. Offsets come from the ifnet_ioctl disassembly, not a header.
-#define ITLWM_IFNET_IOCTL_OFFSET 0x280
-void ItlwmIfnetTrap(void *ifp)
-{
-    static int armed = -1;
-    if (armed < 0) {
-        uint32_t n = 0;
-        armed = PE_parse_boot_argn("itlifnettrap", &n, sizeof(n)) ? (int)n : 0;
-    }
-    if (armed == 0 || ifp == NULL)
-        return;
-    const uint8_t *p = (const uint8_t *)ifp;
-    unsigned long ioctlFn = *(const unsigned long *)(p + ITLWM_IFNET_IOCTL_OFFSET);
-    panic("ITLWM ifnet trap: ifp=%p if_ioctl=0x%lx markref=%p delta=0x%lx events=%u",
-          ifp, ioctlFn, (void *)&ItlwmMarkRef,
-          (long)(ioctlFn - (unsigned long)&ItlwmMarkRef), gItlwmTraceCount);
-}
-
-void ItlwmTrace(uint32_t id, const void *ra);
-
-// Every ioctl IONetworkInterface::if_ioctl routes to us, with its number.
-//
-// Only SOME commands reach the fault. IOEthernetInterface::performCommand splits on:
-//     movabs rax, 0xffffffff7fdf96f4 ; add rax, cmd ; cmp rax, 0x39 ; ja  other
-//     movabs rcx, 0x201016000000011  ; bt  rcx, rax ; jae other
-// and only the "gated" side goes executeCommand -> performGatedCommand -> a syncSIOC*
-// handler, which is where the NX fault is. That set is exactly seven commands:
-// SIOCSIFADDR, SIOCSIFFLAGS, SIOCADDMULTI, SIOCDELMULTI, SIOCSIFMTU, SIOCSIFLLADDR,
-// SIOCSIFCAP. Everything else — SIOCGIFMEDIA and the rest of configd's polling — takes the
-// other branch and cannot be responsible. Counting all ioctls just catches that noise.
-//
-//   itlcmdtrap=0  (default) record only
-//   itlcmdtrap=N  panic on the Nth GATED command, before it is dispatched
-static bool ItlwmIsGatedCmd(unsigned long cmd)
-{
-    unsigned long v = cmd + 0xffffffff7fdf96f4UL;
-    if (v > 0x39)
-        return false;
-    return ((0x201016000000011ULL >> v) & 1) != 0;
-}
-
-void ItlwmCmdTrap(unsigned long cmd, void *ctr, void *iface)
-{
-    static uint32_t total, gated;
-    static int trapAt = -1;
-    if (trapAt < 0) {
-        uint32_t n = 0;
-        trapAt = PE_parse_boot_argn("itlcmdtrap", &n, sizeof(n)) ? (int)n : 0;
-    }
-    total++;
-    ItlwmTrace(17, (const void *)cmd);
-    if (!ItlwmIsGatedCmd(cmd))
-        return;
-    gated++;
-    if (trapAt != 0 && gated == (uint32_t)trapAt) {
-        // syncSIOCSIFFLAGS ends with two dispatches through THIS interface's vtable:
-        //     call qword ptr [rax + 0x918]   ; slot 291 IONetworkInterface::setFlags
-        //     mov  rax, [rax + 0x788] ; jmp rax  ; slot 241 IOService::errnoFromReturn
-        // Both are inherited slots, and in our built kext every inherited slot is zero —
-        // only our own 10 overrides carry a value. They are filled by the loader patching
-        // our vtable from Apple's. Read them back from the live object: if either is not a
-        // sane function, that patching is what kills us, and the NX target will be sitting
-        // right here in the panic string.
-        const void *const *vt = *(const void *const **)iface;
-        panic("ITLWM cmd trap: gated#%u cmd=0x%lx ctr=%p iface=%p vt=%p "
-              "slot241=%p slot291=%p ioctls=%u events=%u",
-              gated, cmd, ctr, iface, (const void *)vt,
-              vt ? vt[241] : NULL, vt ? vt[291] : NULL, total, gItlwmTraceCount);
-    }
-}
-
-void ItlwmTrace(uint32_t id, const void *ra)
-{
-    uint32_t slot = gItlwmTraceCount % ITLWM_TRACE_RING;
-    gItlwmTraceId[slot] = (uint8_t)id;
-    gItlwmTraceRA[slot] = ra ? (int32_t)((long)ra - (long)&ItlwmMarkRef) : 0;
-    gItlwmTraceCount++;
-
-    if (id == 16) {
-        // Arm only once attachToDataLinkLayer has RETURNED. Arming on its entry (id 2) fired
-        // inside super::attachToDataLinkLayer, on the getFeatures that
-        // getIfnetHardwareAssistValue makes — a path that completes fine. The fault is later,
-        // in the ifnet_ioctl that attachNetworkInterfaceToBSD issues next.
-        gItlwmAttachSeen = true;
-        return;
-    }
-
-    if (id == 1) {
-        gItlwmGetProvFaked++;
-        static int provTrap = -1;
-        if (provTrap < 0) {
-            uint32_t n = 0;
-            provTrap = PE_parse_boot_argn("itlprovtrap", &n, sizeof(n)) ? (int)n : 1;
-        }
-        if (provTrap != 0 && gItlwmGetProvFaked == (uint32_t)provTrap)
-            ItlwmTraceTrap("getProvider", id, ra);
-        return;
-    }
-
-    // The ioctl-path trigger. Armed only after attachToDataLinkLayer, so the same overrides
-    // called during start() do not consume it.
-    static int markTrap = -1;
-    if (markTrap < 0) {
-        uint32_t n = 0;
-        markTrap = PE_parse_boot_argn("itlmarktrap", &n, sizeof(n)) ? (int)n : 5;
-    }
-    if (markTrap != 0 && gItlwmAttachSeen && id >= (uint32_t)markTrap)
-        ItlwmTraceTrap("mark", id, ra);
-}
-}
-#define ITLWM_IF_MARK(id) ItlwmTrace((id), __builtin_return_address(0))
-#else
-#define ITLWM_IF_MARK(id) do { } while (0)
-#endif
 
 #if __IO80211_TARGET >= __MAC_26_0
 // Tahoe consumed IONetworkController's reserved vtable slots 6 and 7 for real methods
@@ -277,14 +88,6 @@ extern uint32_t gItlwmIctPaddrLo;
 extern uint32_t gItlwmIctTblReg;
 }
 extern "C" {
-extern uint32_t gItlwmSkyIfStarted;
-extern uint32_t gItlwmSkyIfHasState;
-extern uint32_t gItlwmSkyIfHasEvtSrc;
-extern uint32_t gItlwmSkyIfLadder;
-extern uint32_t gItlwmEventPipeCalls;
-extern uint32_t gItlwmEventPipeRefused;
-extern uint32_t gItlwmEventPipeDestroys;
-extern uint32_t gItlwmEventPipeDestroysRefused;
 extern uint32_t gItlwmPrepareBSDUngated;
 extern uint32_t gItlwmPostMsgQueued;
 extern uint32_t gItlwmPostMsgSent;
@@ -326,7 +129,6 @@ extern uint32_t gItlwmExtBssInfoCalls;
 // Mechanism 1 (real Skywalk registration). Stage is set once during start(), so it
 // is deliberately part of the change guard below: without that, a boot where nothing else moved
 // would publish nothing and the stage would read as absent rather than as its real value.
-extern uint32_t gItlwmSkywalkEnabled;
 extern uint32_t gItlwmSkywalkStage;
 extern uint32_t gItlwmSkywalkRegRet;
 extern uint32_t gItlwmSkywalkTxDequeue;
@@ -436,29 +238,6 @@ static void publishPreinitMark(IOService *provider, ItlHalService *hal)
     provider->setProperty("ItlwmIctPaddrLo", (UInt64)gItlwmIctPaddrLo, 32);
     provider->setProperty("ItlwmIctTblReg", (UInt64)gItlwmIctTblReg, 32);
 
-#if defined(__IO80211_TARGET) && __IO80211_TARGET >= __MAC_26_0
-    // Only reachable on a boot that survives — i.e. with the trap disarmed (itlprovtrap=0)
-    // or never triggered. On a panicking boot the trace arrives in the panic string instead.
-    provider->setProperty("ItlwmTraceCount", (UInt64)gItlwmTraceCount, 32);
-    provider->setProperty("ItlwmGetProvCount", (UInt64)gItlwmGetProvCount, 32);
-    provider->setProperty("ItlwmGetProvFaked", (UInt64)gItlwmGetProvFaked, 32);
-
-    // Skywalk interface start state. IO80211SkywalkInterface::start is the only writer of
-    // state[0xa8]; createEventPipe dereferences it without a check.
-    //   SkyIfStarted 0            -> super::start() failed outright
-    //   HasState 0                -> Apple's per-interface state was never allocated
-    //   HasState 1, HasEvtSrc 0   -> start ran but did not get far enough to publish it;
-    //                                every EventPipeRefused is a panic we avoided
-    provider->setProperty("ItlwmSkyIfStarted", (UInt64)gItlwmSkyIfStarted, 32);
-    provider->setProperty("ItlwmSkyIfHasState", (UInt64)gItlwmSkyIfHasState, 32);
-    provider->setProperty("ItlwmSkyIfHasEvtSrc", (UInt64)gItlwmSkyIfHasEvtSrc, 32);
-    provider->setProperty("ItlwmSkyIfLadder", (UInt64)gItlwmSkyIfLadder, 32);
-    provider->setProperty("ItlwmEventPipeCalls", (UInt64)gItlwmEventPipeCalls, 32);
-    provider->setProperty("ItlwmEventPipeRefused", (UInt64)gItlwmEventPipeRefused, 32);
-    provider->setProperty("ItlwmEventPipeDestroys", (UInt64)gItlwmEventPipeDestroys, 32);
-    provider->setProperty("ItlwmEventPipeDestroysRefused",
-                          (UInt64)gItlwmEventPipeDestroysRefused, 32);
-#endif
 
     ItlIwx *iwx = OSDynamicCast(ItlIwx, hal);
     if (iwx) {
@@ -612,20 +391,15 @@ eventHandler(struct ieee80211com *ic, int msgCode, void *data)
 }
 
 #if __IO80211_TARGET >= __MAC_26_0
-// The ItlwmSkyIf* / ItlwmEventPipe* counters are otherwise published only from
-// publishPreinitMark, which runs *only* when fHalService->attach() fails. That makes them
-// invisible on exactly the boots where they matter: the event-pipe guards fire long after
-// start(), when airportd adopts the interface, and on a working boot nothing ever published
-// them. Republish from the watchdog, which already ticks every kWatchDogTimerPeriod once the
-// adapter is enabled.
+// publishPreinitMark runs *only* when fHalService->attach() fails, so anything published only
+// from there is invisible on exactly the boots where the driver works. Republish from the
+// watchdog, which already ticks every kWatchDogTimerPeriod once the adapter is enabled.
 //
 // On `this`, not on the provider: getProvider() is one of the inherited slots the kext loader
 // can mis-bind, and this kext also carries AirportItlwmEthernetInterface::getProvider. Read with
 //     ioreg -r -c AirportItlwm -l -w0 | grep -i itlwm
 // Change-guarded so a healthy system is not rewriting IORegistry properties once a second
 // forever. File-scope statics, POD and zero-initialised, so no __cxa_guard is emitted.
-static uint32_t sLastPipeCalls, sLastPipeRefused;
-static uint32_t sLastPipeDestroys, sLastPipeDestroysRefused;
 static uint32_t sLastPostQueued, sLastPostSent, sLastPostDropped;
 static uint32_t sLastScanCalls, sLastScanStarted, sLastScanRefused, sLastScanBeacons;
 static uint32_t sLastAssocCalls, sLastAssocStarted, sLastAssocRefused, sLastAssocNoPmk, sLastAssocKeyInReq;
@@ -642,12 +416,23 @@ static uint32_t sLastSkywalkStage, sLastSkywalkTxDequeue, sLastSkywalkRxDequeue;
 // question asked of it — is it *still* posting — without a write per interval.
 static uint32_t sLastLqmPostBucket, sLastLqmBeaconStall;
 static uint32_t sLastScanFailDes, sLastScanFailOr, sLastEssClears, sLastAssocEsslen;
-static bool sPublishedSkyIf;
+static bool sPublishedOnce;
 
 void AirportItlwm::publishRuntimeCounters()
 {
-    if (!sPublishedSkyIf) {
-        sPublishedSkyIf = true;
+    if (!sPublishedOnce) {
+        sPublishedOnce = true;
+        // The HAL bring-up markers. These used to be published ONLY from publishPreinitMark,
+        // which runs only inside the `if (!fHalService->attach(pciNub))` failure branch — so on
+        // every boot where the driver works they were never published at all, and two mechanisms
+        // whose "Done when" is "read this on one surviving boot" could not be closed even in
+        // principle. Root AGENTS.md mechanisms 4 (ItlwmIctPaddrLo / ItlwmIctTblReg) and 8
+        // (ItlwmInitMark / ItlwmPreSleepInitComplete). Same defect the SkyIf counters had, and
+        // the same fix: republish here, where the boot survives.
+        //
+        // On `this`, not the provider, so both nodes are readable and comparable:
+        //     ioreg -r -c AirportItlwm -l -w0 | grep -i itlwm
+        publishPreinitMark(this, fHalService);
         // struct ieee80211com's size as the HAL and as net80211 each see it. These must be equal.
         // They differ only if one object file was built against a stale ieee80211_var.h, and then
         // every ic_* offset in that object is wrong — the HAL writes its softc over the tail of
@@ -657,17 +442,9 @@ void AirportItlwm::publishRuntimeCounters()
         // ieee80211com; a clean build is the fix.
         setProperty("ItlwmIcSizeHal", (UInt64)gItlwmIcSizeHal, 32);
         setProperty("ItlwmIcSizeNet", (UInt64)gItlwmIcSizeNet, 32);
-        setProperty("ItlwmSkyIfStarted", (UInt64)gItlwmSkyIfStarted, 32);
-        setProperty("ItlwmSkyIfHasState", (UInt64)gItlwmSkyIfHasState, 32);
-        setProperty("ItlwmSkyIfHasEvtSrc", (UInt64)gItlwmSkyIfHasEvtSrc, 32);
-        setProperty("ItlwmSkyIfLadder", (UInt64)gItlwmSkyIfLadder, 32);
         setProperty("ItlwmPrepareBSDUngated", (UInt64)gItlwmPrepareBSDUngated, 32);
     }
-    if (gItlwmEventPipeCalls == sLastPipeCalls &&
-        gItlwmEventPipeRefused == sLastPipeRefused &&
-        gItlwmEventPipeDestroys == sLastPipeDestroys &&
-        gItlwmEventPipeDestroysRefused == sLastPipeDestroysRefused &&
-        gItlwmPostMsgQueued == sLastPostQueued &&
+    if (gItlwmPostMsgQueued == sLastPostQueued &&
         gItlwmPostMsgSent == sLastPostSent &&
         gItlwmPostMsgDropped == sLastPostDropped &&
         gItlwmScanReqCalls == sLastScanCalls &&
@@ -752,14 +529,6 @@ void AirportItlwm::publishRuntimeCounters()
     sLastPostQueued = gItlwmPostMsgQueued;
     sLastPostSent = gItlwmPostMsgSent;
     sLastPostDropped = gItlwmPostMsgDropped;
-    sLastPipeCalls = gItlwmEventPipeCalls;
-    sLastPipeRefused = gItlwmEventPipeRefused;
-    sLastPipeDestroys = gItlwmEventPipeDestroys;
-    sLastPipeDestroysRefused = gItlwmEventPipeDestroysRefused;
-    setProperty("ItlwmEventPipeCalls", (UInt64)gItlwmEventPipeCalls, 32);
-    setProperty("ItlwmEventPipeRefused", (UInt64)gItlwmEventPipeRefused, 32);
-    setProperty("ItlwmEventPipeDestroys", (UInt64)gItlwmEventPipeDestroys, 32);
-    setProperty("ItlwmEventPipeDestroysRefused", (UInt64)gItlwmEventPipeDestroysRefused, 32);
     setProperty("ItlwmPostMsgQueued", (UInt64)gItlwmPostMsgQueued, 32);
     setProperty("ItlwmPostMsgSent", (UInt64)gItlwmPostMsgSent, 32);
     setProperty("ItlwmPostMsgDropped", (UInt64)gItlwmPostMsgDropped, 32);
@@ -857,7 +626,6 @@ void AirportItlwm::publishRuntimeCounters()
     // Read TxFrames against TxDequeue to tell "the family is asking" from "we are sending":
     // TxDequeue climbing with TxFrames flat is frames consumed and thrown away, which looks
     // exactly like working TX from the family's side and like a dead network from the user's.
-    setProperty("ItlwmSkywalkEnabled", (UInt64)gItlwmSkywalkEnabled, 32);
     setProperty("ItlwmSkywalkStage", (UInt64)gItlwmSkywalkStage, 32);
     setProperty("ItlwmSkywalkRegRet", (UInt64)gItlwmSkywalkRegRet, 32);
     setProperty("ItlwmSkywalkTxDequeue", (UInt64)gItlwmSkywalkTxDequeue, 32);
@@ -1734,20 +1502,7 @@ IOService* AirportItlwm::probe(IOService *provider, SInt32 *score)
 #define LOWER32(x)  ((uint64_t)(x) & 0xffffffff)
 #define HIGHER32(x) ((uint64_t)(x) >> 32)
 
-// Set from the -itlmincc boot-arg before initCCLogs() runs; see AirportItlwm::start().
-static bool gItlwmMinimalCC = false;
-// -itlccowner: hand CoreCapture the provider (IOPCIEDeviceWrapper), which is fully
-// started and registered, instead of `this`, which has not run super::start() yet at the
-// point Tahoe forces us to build the log pipes. CCPipe retains the owner and stores it;
-// if any of that requires a started IOService, this is the difference.
-static IOService *gItlwmCCOwner = NULL;
-// itlccsize=<KB>: size of the two large CoreCapture pipes. Default 2048 KB (0x200000) is
-// the upstream value. -itlmincc creates exactly ONE pipe of this size and still hangs 2/2,
-// while creating none boots 5/5 — so a single 2 MB wired allocation this early in boot is
-// enough to destabilise it. Shrinking it tests that directly; it is the one property of
-// our CoreCapture usage that was never questioned.
-static UInt64 gItlwmCCPipeSize = 0x200000;
-
+// CoreCapture ring size, and the notify threshold that has to track it.
 // CCLogPipe::initWithOwnerNameCapacity validates the options before allocating anything and
 // returns false when min_log_size_notify > pipe_size:
 //
@@ -1755,11 +1510,11 @@ static UInt64 gItlwmCCPipeSize = 0x200000;
 //     cmp rax, [r14 + 0x10]   ; pipe_size
 //     jbe proceed             ; else os_log the mismatch and return false
 //
-// So the notify threshold has to track the ring, not stay pinned at the upstream literal —
-// otherwise every pipe_size below 0xccccc (819 KB) is rejected and start() aborts, which
-// looks exactly like a clean boot. The upstream 0xccccc is 40% of the stock 2 MB ring, and
-// this expression reproduces it exactly there (0x200000 * 2 / 5 == 0xccccc), so behaviour
-// at the default size is unchanged.
+// Upstream pins the threshold at the literal 0xccccc, which is 40% of the stock 2 MB ring, so
+// expressing it as a fraction reproduces upstream exactly and keeps the two in step if the ring
+// is ever resized. Apple's own `ccpipe:DriverLogs` boot-arg overrides the real allocation from
+// outside without touching this struct, which is the right way to test a different size.
+#define ITLWM_CC_PIPE_SIZE          0x200000ULL
 #define ITLWM_CC_NOTIFY(pipeSize)   ((pipeSize) * 2 / 5)
 
 bool AirportItlwm::
@@ -1768,8 +1523,8 @@ initCCLogs()
     CCPipeOptions driverLogOptions = { 0 };
     driverLogOptions.pipe_type = 0;
     driverLogOptions.log_data_type = 1;
-    driverLogOptions.pipe_size = gItlwmCCPipeSize;
-    driverLogOptions.min_log_size_notify = ITLWM_CC_NOTIFY(gItlwmCCPipeSize);
+    driverLogOptions.pipe_size = ITLWM_CC_PIPE_SIZE;
+    driverLogOptions.min_log_size_notify = ITLWM_CC_NOTIFY(ITLWM_CC_PIPE_SIZE);
     driverLogOptions.notify_threshold = 1000;
     strlcpy(driverLogOptions.file_name, "Itlwm_Logs", sizeof(driverLogOptions.file_name));
     snprintf(driverLogOptions.name, sizeof(driverLogOptions.name), "wlan%d", 0);
@@ -1778,14 +1533,14 @@ initCCLogs()
     driverLogOptions.pad10 = 2;
     driverLogOptions.file_options = 0;
     driverLogOptions.log_policy = 0;
-    driverLogPipe = CCPipe::withOwnerNameCapacity(gItlwmCCOwner ? gItlwmCCOwner : this, "com.zxystd.AirportItlwm", "DriverLogs", &driverLogOptions);
+    driverLogPipe = CCPipe::withOwnerNameCapacity(this, "com.zxystd.AirportItlwm", "DriverLogs", &driverLogOptions);
     XYLog("%s driverLogPipeRet %d\n", __FUNCTION__, driverLogPipe != NULL);
     
     memset(&driverLogOptions, 0, sizeof(driverLogOptions));
     driverLogOptions.pipe_type = 0;
     driverLogOptions.log_data_type = 0;
-    driverLogOptions.pipe_size = gItlwmCCPipeSize;
-    driverLogOptions.min_log_size_notify = ITLWM_CC_NOTIFY(gItlwmCCPipeSize);
+    driverLogOptions.pipe_size = ITLWM_CC_PIPE_SIZE;
+    driverLogOptions.min_log_size_notify = ITLWM_CC_NOTIFY(ITLWM_CC_PIPE_SIZE);
     driverLogOptions.notify_threshold = 1000;
     strlcpy(driverLogOptions.file_name, "AppleBCMWLAN_Datapath", sizeof(driverLogOptions.file_name));
     strlcpy(driverLogOptions.directory_name, "WiFi", sizeof(driverLogOptions.directory_name));
@@ -1793,18 +1548,14 @@ initCCLogs()
     driverLogOptions.pad10 = LOWER32(0x202800000);
     driverLogOptions.file_options = 0;
     driverLogOptions.log_policy = 0;
-    if (!gItlwmMinimalCC) {
-        driverDataPathPipe = CCPipe::withOwnerNameCapacity(gItlwmCCOwner ? gItlwmCCOwner : this, "com.zxystd.AirportItlwm", "DatapathEvents", &driverLogOptions);
-        XYLog("%s driverDataPathPipeRet %d\n", __FUNCTION__, driverDataPathPipe != NULL);
-    }
-    
-    // Deliberately NOT gated on gItlwmMinimalCC. -itlmincc used to skip this block, which
-    // left getFaultReporterFromDriver() returning NULL — and NULL is not the clean
-    // start()-returns-false that the boot-arg comment above once claimed. Apple panics on it
-    // (findAndAttachToFaultReporter+0x10f), and -itlnocc only escapes because getLogger()
-    // is checked first, at IO80211Controller::start+0x17e, long before the reporter is
-    // fetched at +0x272. So -itlmincc now means "no datapath pipe" and nothing more; the
-    // snapshots pipe and the fault-reporter chain are not optional on Tahoe.
+    driverDataPathPipe = CCPipe::withOwnerNameCapacity(this, "com.zxystd.AirportItlwm", "DatapathEvents", &driverLogOptions);
+    XYLog("%s driverDataPathPipeRet %d\n", __FUNCTION__, driverDataPathPipe != NULL);
+
+    // The snapshots pipe and the fault-reporter chain are NOT optional on Tahoe.
+    // getFaultReporterFromDriver() returning NULL is not a clean start()-returns-false: Apple
+    // panics on it at findAndAttachToFaultReporter+0x10f. getLogger() is checked earlier, at
+    // IO80211Controller::start+0x17e, which is why a driver with no CoreCapture at all fails
+    // cleanly while one with a partial chain does not.
     {
         memset(&driverLogOptions, 0, sizeof(driverLogOptions));
         driverLogOptions.pipe_type = 0x200000001;
@@ -1813,7 +1564,7 @@ initCCLogs()
         strlcpy(driverLogOptions.name, "0", sizeof(driverLogOptions.name));
         strlcpy(driverLogOptions.directory_name, "WiFi", sizeof(driverLogOptions.directory_name));
         driverLogOptions.pipe_size = 128;
-        driverSnapshotsPipe = CCPipe::withOwnerNameCapacity(gItlwmCCOwner ? gItlwmCCOwner : this, "com.zxystd.AirportItlwm", "StateSnapshots", &driverLogOptions);
+        driverSnapshotsPipe = CCPipe::withOwnerNameCapacity(this, "com.zxystd.AirportItlwm", "StateSnapshots", &driverLogOptions);
         XYLog("%s driverSnapshotsPipeRet %d\n", __FUNCTION__, driverSnapshotsPipe != NULL);
 
         CCStreamOptions faultReportOptions = { 0 };
@@ -1860,10 +1611,8 @@ initCCLogs()
     if (!driverLogger)
         return false;
 #endif
-    // driverFaultReporter is required in both configurations: returning false here is the
-    // only way to refuse the start *before* Apple reaches the slot that panics on NULL.
-    if (gItlwmMinimalCC)
-        return driverLogPipe && driverSnapshotsPipe && driverFaultReporter;
+    // driverFaultReporter is required: returning false here is the only way to refuse the
+    // start *before* Apple reaches the slot that panics on NULL.
     return driverLogPipe && driverDataPathPipe && driverSnapshotsPipe && driverFaultReporter;
 }
 
@@ -1903,72 +1652,22 @@ bool AirportItlwm::start(IOService *provider)
     setProperty("built-in", OSData::withBytes(&builtIn, sizeof(builtIn)));
     setProperty("DriverKitDriver", kOSBooleanFalse);
 #if __IO80211_TARGET >= __MAC_26_0
-    // Tahoe's IO80211Controller::start() calls getLogger() (slot 424) via
-    // IO80211ControllerMonitor::initWithControllerAndProvider and fails with
-    // kIOReturnNoResources if it returns NULL, so the CC log pipes have to exist first.
+    // Tahoe is the only target that builds the CoreCapture pipes BEFORE super::start(); every
+    // earlier release builds them after. It has to, because IO80211ControllerMonitor::
+    // initWithControllerAndProvider fails with kIOReturnNoResources when getLogger()
+    // (slot 424) returns NULL, and IO80211Controller::start() calls it at +0x17e.
     //
-    // Boot-arg experiment for the intermittent early hang, OFF unless explicitly asked
-    // for, so the default binary behaves exactly as it did without this block. Booting
-    // with `-itlnocc` skips CoreCapture setup entirely: getLogger() then returns NULL,
-    // IO80211ControllerMonitor fails, and super::start() returns false — a clean,
-    // non-hanging failure that still leaves AirportItlwmStage readable in ioreg.
-    //
-    // Tahoe is the only target that creates these pipes *before* super::start(), i.e.
-    // very early in boot alongside APFS mount, and Apple first uses the logger at exactly
-    // the point the hang occurs. If -itlnocc boots reliably, the CC objects are implicated;
-    // if it still hangs, they are exonerated and the search moves elsewhere.
-    // Second level: -itlmincc skips the datapath pipe only. It used to skip the snapshots
-    // pipe and the fault reporter too, on the belief that a NULL fault reporter made
-    // start() return false cleanly — it does not, it panics inside Apple's start(). See the
-    // note at the snapshots pipe in initCCLogs(). Keeping both flags in ONE binary matters:
-    // any rebuild appears to shift the hang's probability, so the three configurations must
-    // be compared without changing the kext.
-    int boot_ccarg = 0;
-    bool skipCC = PE_parse_boot_argn("-itlnocc", &boot_ccarg, sizeof(boot_ccarg));
-    gItlwmMinimalCC = PE_parse_boot_argn("-itlmincc", &boot_ccarg, sizeof(boot_ccarg));
-    gItlwmCCOwner = PE_parse_boot_argn("-itlccowner", &boot_ccarg, sizeof(boot_ccarg))
-                        ? provider : NULL;
-    int ccKB = 0;
-    if (PE_parse_boot_argn("itlccsize", &ccKB, sizeof(ccKB)) && ccKB > 0 && ccKB <= 8192)
-        gItlwmCCPipeSize = (UInt64)ccKB * 1024;
-    if (provider) {
-        provider->setProperty("ItlwmSkipCC", (UInt64)(skipCC ? 1 : 0), 32);
-        provider->setProperty("ItlwmMinCC", (UInt64)(gItlwmMinimalCC ? 1 : 0), 32);
-        provider->setProperty("ItlwmCCOwner", (UInt64)(gItlwmCCOwner ? 1 : 0), 32);
-        provider->setProperty("ItlwmCCPipeKB", (UInt64)(gItlwmCCPipeSize / 1024), 32);
-    }
-    if (!skipCC) {
-        bool ccOk = initCCLogs();
-        // Publish whether a ring was actually allocated. AirportItlwmStage cannot answer
-        // this: STAGE(2) sits after super::start(), so Stage 1 is ambiguous between "the
-        // pipe was rejected" and "the pipe was fine but super::start() failed" — and under
-        // -itlmincc there is no fault reporter, which is its own reason to fail. Without
-        // this property a clean boot cannot be distinguished from a boot that did nothing.
-        if (provider)
-            provider->setProperty("ItlwmCCPipeOK", (UInt64)(driverLogPipe != NULL), 32);
-        if (!ccOk) {
-            XYLog("CCLog init fail\n");
-            releaseAll();
-            return false;
-        }
-    }
-    // -itlnostart: build CoreCapture exactly as normal, then stop before Apple's
-    // IO80211Controller::start(). This is the bisect the boot record actually calls for.
-    //
-    // Every configuration that has booted cleanly (-itlnocc, and itlccsize below the
-    // rejection threshold) leaves getLogger() NULL, so super::start() turns around at its
-    // logger check. Every configuration that hangs leaves getLogger() non-NULL, so
-    // super::start() runs the full Apple path. Pipe COUNT and pipe SIZE have both been
-    // varied without changing the outcome — 64 KB and 2 MB hang alike — so "a pipe exists"
-    // is not obviously the operative variable; "Apple's start() ran on" is.
-    //
-    // Deliberately does NOT releaseAll(): the pipes stay live, so the only difference from
-    // the hanging configuration is that super::start() never runs.
-    int noStart = 0;
-    if (PE_parse_boot_argn("-itlnostart", &noStart, sizeof(noStart))) {
-        if (provider)
-            provider->setProperty("ItlwmNoStart", (UInt64)1, 32);
-        XYLog("-itlnostart: stopping before super::start()\n");
+    // Creating a CCPipe this early in boot is what IOPCIEDeviceWrapper's deferred publish
+    // exists to move out of the way; see the note there and root AGENTS.md mechanism 7.
+    bool ccOk = initCCLogs();
+    // Publish whether a ring was actually allocated. AirportItlwmStage cannot answer this:
+    // STAGE(2) sits after super::start(), so Stage 1 is ambiguous between "the pipe was
+    // rejected" and "the pipe was fine but super::start() failed".
+    if (provider)
+        provider->setProperty("ItlwmCCPipeOK", (UInt64)(driverLogPipe != NULL), 32);
+    if (!ccOk) {
+        XYLog("CCLog init fail\n");
+        releaseAll();
         return false;
     }
 #endif
@@ -2043,26 +1742,6 @@ bool AirportItlwm::start(IOService *provider)
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOHT40;
     
     STAGE(9);
-#if __IO80211_TARGET >= __MAC_26_0
-    // -itlnohal: run everything up to and including super::start(), then skip the Intel
-    // firmware bring-up. Mirrors the attach-failure path exactly (super::stop + releaseAll
-    // + return false) without ever calling attach, so the ONLY difference from -itlmincc is
-    // whether iwx_attach/iwx_preinit ran.
-    //
-    // Every configuration that has booted cleanly is one where this call never happened;
-    // every configuration that hangs is one where it did. The two deferred boots that did
-    // reach it and survived are the ones that published ItlwmPreinitMark=6 / Err=35 — the
-    // firmware wait timing out cleanly rather than never returning.
-    int noHal = 0;
-    if (PE_parse_boot_argn("-itlnohal", &noHal, sizeof(noHal))) {
-        if (provider)
-            provider->setProperty("ItlwmNoHal", (UInt64)1, 32);
-        XYLog("-itlnohal: skipping fHalService->attach()\n");
-        super::stop(pciNub);
-        releaseAll();
-        return false;
-    }
-#endif
     if (!fHalService->attach(pciNub)) {
         XYLog("attach fail\n");
 #if __IO80211_TARGET >= __MAC_26_0
@@ -2178,6 +1857,9 @@ bool AirportItlwm::start(IOService *provider)
         releaseAll();
         return false;
     }
+    // Upstream calls this twice with identical arguments on the same stack object. Left as-is
+    // deliberately: it predates the Tahoe work, it is idempotent, and every V2 release ships it.
+    // Root AGENTS.md mechanism 11.
     if (!fNetIf->initRegistrationInfo(&registInfo, 1, sizeof(registInfo))) {
         XYLog("initRegistrationInfo fail\n");
         super::stop(provider);
@@ -2213,7 +1895,26 @@ bool AirportItlwm::start(IOService *provider)
     // cannot be cleared later — it has to be absent before matching.
     if (fNetIf->getInterfaceRole() == 1 && !skywalkOwnsBSD)
         fNetIf->deferBSDAttach(true);
+#if __IO80211_TARGET >= __MAC_26_0
+    // Tahoe only, and deliberately not extended to the releases that already ship without it.
+    //
+    // A false here is fatal. IO80211SkywalkInterface::start is what allocates the per-interface
+    // state block that the family then dereferences unchecked — createEventPipe and
+    // destroyEventPipe reach state[0xa8] with no NULL test, so the first IO80211APIUserClient a
+    // half-started interface sees takes the machine down. This driver used to carry hand-written
+    // raw-offset NULL guards on both of those (root AGENTS.md mechanism 2); checking the return
+    // here is what replaced them, so do not weaken it back to a bare call without restoring them.
+    //
+    // Measured 1 on every booting Tahoe build, so the check is inert on the working path.
+    if (!fNetIf->start(this)) {
+        XYLog("Skywalk interface start fail\n");
+        super::stop(provider);
+        releaseAll();
+        return false;
+    }
+#else
     fNetIf->start(this);
+#endif
 
 #if __IO80211_TARGET >= __MAC_26_0
     // Replace the two jobs AirportItlwmEthernetInterface::attachToDataLinkLayer used to do for the
@@ -2399,7 +2100,6 @@ bool AirportItlwm::createMediumTables(const IONetworkMedium **primary)
 }
 
 IOReturn AirportItlwm::selectMedium(const IONetworkMedium *medium) {
-    ITLWM_IF_MARK(13);
     setSelectedMedium(medium);
     return kIOReturnSuccess;
 }
@@ -2593,7 +2293,6 @@ const OSString * AirportItlwm::newModelString() const
 
 IOReturn AirportItlwm::getHardwareAddress(IOEthernetAddress *addrP)
 {
-    ITLWM_IF_MARK(6);
     if (IEEE80211_ADDR_EQ(etheranyaddr, fHalService->get80211Controller()->ic_myaddr))
         return kIOReturnError;
     else {
@@ -2604,7 +2303,6 @@ IOReturn AirportItlwm::getHardwareAddress(IOEthernetAddress *addrP)
 
 IOReturn AirportItlwm::setHardwareAddress(const void *addrP, UInt32 addrBytes)
 {
-    ITLWM_IF_MARK(5);
     if (!fNetIf || !addrP)
         return kIOReturnError;
     if_setlladdr(&fHalService->get80211Controller()->ic_ac.ac_if, (const UInt8 *)addrP);
@@ -2617,31 +2315,26 @@ IOReturn AirportItlwm::setHardwareAddress(const void *addrP, UInt32 addrBytes)
 
 UInt32 AirportItlwm::getFeatures() const
 {
-    ITLWM_IF_MARK(12);
     return fHalService->getDriverInfo()->supportedFeatures();
 }
 
 IOReturn AirportItlwm::setPromiscuousMode(IOEnetPromiscuousMode mode)
 {
-    ITLWM_IF_MARK(8);
     return kIOReturnSuccess;
 }
 
 IOReturn AirportItlwm::setMulticastMode(IOEnetMulticastMode mode)
 {
-    ITLWM_IF_MARK(9);
     return kIOReturnSuccess;
 }
 
 IOReturn AirportItlwm::setMulticastList(IOEthernetAddress* addr, UInt32 len)
 {
-    ITLWM_IF_MARK(10);
     return fHalService->getDriverController()->setMulticastList(addr, len);
 }
 
 IOReturn AirportItlwm::getPacketFilters(const OSSymbol *group, UInt32 *filters) const
 {
-    ITLWM_IF_MARK(7);
     IOReturn    rtn = kIOReturnSuccess;
     if (group == gIOEthernetWakeOnLANFilterGroup && magicPacketSupported)
         *filters = kIOEthernetWakeOnMagicPacket;

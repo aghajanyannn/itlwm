@@ -251,8 +251,15 @@ Ordered by how hard the failure is to notice, worst last.
 | `IO80211SkywalkInterface` state +0x120, event source +0xa8 | `AirportItlwmSkywalkInterface.cpp` | **silent**: the event-pipe guards misjudge and refuse or fault |
 | payload structs — `AssocCandidates` 0x6f8, `JoinCompleteEvents` 211/213/216, `LqmEventData` 0x1dc, `BeaconMetaData`, `ExtendedBssInfo` 0x214, `CCPipeOptions` | `include/Airport/*.h` | **silent**: consumers check length exactly and drop a mismatch without a word |
 | WCL message numbers 211/212/213/214/216/237 and ioctls 425/433/446/454/460/502, slot 602 | `apple80211_var.h`, `AirportItlwmSkywalkInterface` | **silent**: an FSM never leaves its in-progress state |
-| `ifnet` +0x228/+0x22c | `AirportItlwmEthernetInterface.cpp` | **safe** — guarded by a family-word check that skips the write if the layout moved |
-| `ifnet` +0x280 | `AirportItlwmV2.cpp` | inert unless `itlifnettrap=1` |
+| `IO80211SkywalkInterface` state +0xe4, via `setInitMacAddress` | `AirportItlwmSkywalkInterface.cpp` | **silent**: the MAC agent mints a random locally-administered address |
+
+`ifnet +0x228/+0x22c` and `ifnet +0x280` were in this table and are **gone** — mechanisms 10 and 9
+deleted both, along with the `ITLWM_SKYIF_*` offsets (mechanism 2). What is left in
+`AirportItlwmSkywalkInterface.cpp` is the four `RegistrationInfo` offsets, and **none of them is a
+typed field**: both `RegistrationInfo` structs are `uint8_t pad[N]`, so every offset lives as a
+`#define` plus prose in `IOSkywalkEthernetInterface.h`. Every *other* Apple payload struct this repo
+reconstructs is typed with `_Static_assert`s, so this one is the odd one out rather than house
+style, and typing it is the cheapest remaining reduction in release-pinned surface.
 
 The `_Static_assert`s on the payload structs prove our reconstruction is *self*-consistent. They
 say nothing about the new kernel, and cannot: both sides of the comparison are ours.
@@ -275,6 +282,31 @@ So the raw-offset table needed no re-derivation: identical `__TEXT_EXEC` and `__
 those bytes did not move. **This is the shape a minor update is expected to have** — a metadata-only
 rebuild — and it is worth knowing that the expensive half of the procedure collapses to one
 comparison when it holds. It will not always hold; Sonoma 14.4 is the counter-example.
+
+### Record: 26.6.1 (25G76) → 26.6.2 (25G83) — real code movement, no ABI movement
+
+**The second run of this procedure, and the first that had to be run *retroactively*: the machine
+was already on 25G83 while `scripts/abi/kc/` held only 25G72 and 25G76.** So `$ITLWM_KC` had been
+silently defaulting to an unarchived kernel, and every ABI check in the repo had last been made
+against a release the machine no longer runs. The collection is archived now — copy it *before* the
+next update, per step 1, or this happens again.
+
+**This is the counter-example to the 26.6 → 26.6.1 record, and it is the more useful shape to know.**
+
+| check | result |
+| --- | --- |
+| segment comparison | `__TEXT_EXEC`, `__DATA_CONST`, `__DATA`, `__HIB`, `__LINKEDIT` and 597 `__REGION*` all **DIFFER**. Real code changed. |
+| `abi-*.txt` diff | **identical apart from the two header lines** — no slot moved, no instance size changed, in any class this repo reconstructs |
+| external symbols | 956 undefined, **0** missing. Export surface delta 25G76 → 25G83 is **6 added, 0 removed**, all VM/TRM internals (`_vm_object_readonly_*`, `_TRMMultiState_ReplaceInBuffer`) |
+| `mapdrv.py` | 211 + 45 correct / **0** wrong |
+| `callcheck.sh` | 2 classes, 94 slots, **WRONG: 0** |
+| step 8 raw offsets | re-derived and unchanged: `mExpansionData` +0xc0, `RegistrationInfo` +0x0c / +0x38 / +0x108, both MAC-stamp guards (`[this+0x128]->byte[0x3c50] & 1`, `[this+0x120]->dword[0x58] == 1`), `IOSkywalkLegacyEthernet::probe` still forking on `IOInterfaceUnit`, `setInitMacAddress` still writing state +0xe4/+0xe8 |
+
+**The lesson is that step 4a's shortcut is one-directional.** Byte-identical `__TEXT_EXEC` and
+`__DATA_CONST` prove nothing moved; *differing* ones prove only that code changed, not that any of
+it matters. 25G83 changed real code and moved nothing this repo depends on. So a differing segment
+comparison is a **trigger to run steps 5–8**, not a finding in itself — and steps 5–8 are cheap
+enough (minutes, no reboot) that the shortcut only ever saves the offset re-derivation in step 8.
 
 ### The tooling lies immediately after an update
 
@@ -368,6 +400,117 @@ Diagnostics reach the developer by three routes:
   logging its `ifCount` is the gate on whether a Wi-Fi device exists at all as far as
   `airportd` is concerned.
 
+## Checkpoint — state of the cleanup pass, and what to do next
+
+Everything below is **built and statically verified, and NOTHING here has been booted.** The
+recovery path is the previous kext on the EFI plus `scripts/kextuuid.py --expect`.
+
+**Verified, all ten targets Release + Tahoe Debug:** `mapdrv.py` 211 + 45 correct / 0 wrong,
+`callcheck.sh` 94 slots / 0 wrong, 956 undefined symbols / 0 missing — all three against the
+**running 25G83** collection, now archived. 211 is 213 minus the two event-pipe overrides deleted
+below; that drop is the expected delta, not a regression.
+
+### Landed this pass
+
+- **Deleted:** the `ItlwmTrace` ring and its four boot-arg panic traps (**two defaulted to
+  ARMED**), the six CoreCapture bisection boot-args, `forceWiFiSubfamily`, the event-pipe NULL
+  guards, `ItlwmSkywalkEnabled`, and with them four release-pinned raw offsets. Mechanisms 2, 10
+  and the panic-trap half of 9 are closed.
+- **`fNetIf->start()`'s return is fatal on Tahoe** — that is what made the event-pipe guards
+  deletable. The two are one change; see mechanism 2.
+- **A real bug fixed:** `AirportItlwmSkywalkInterface::init` discarded its `ether_addr *`, so
+  mechanism 21's caller-side MAC seed had been a no-op since it shipped. Now goes through
+  `setInitMacAddress` (vtable-neutral, verified absent from every class table).
+- **`itldefer` is GONE.** It was measured (`boot-uuid-media` at 66 ms, registry quiet at 17.7 s,
+  publishing at 30 s), then deleted after `-itlnodefer` booted 5/5 — with the confounded hang
+  record, not the tally, as the load-bearing argument. `IOPCIEDeviceWrapper` is back to upstream.
+  A personality `IOResourceMatch` array was tried and reverted: the key takes an OSString or an
+  OSDictionary only, and the array failed open, disabling the gate that was already there.
+- **HAL markers are published on surviving boots** for the first time, which is what unblocks
+  mechanisms 4 and 8.
+
+### Live baseline, measured on 26.6.2 (25G83) with the PRE-cleanup kext
+
+A join / disconnect / rejoin on the running machine, captured to `scratch/logs/`. This is the
+reference the new build has to match or beat, and it is the first time several of these have been
+read on a working connection:
+
+```text
+AssocCalls=2 Started=2 Refused=0    JoinAssocDone=2 ConnectDone=2 Timeouts=0 MaxState=3
+AssocKeyInReq=2 AssocNoPmk=0        ScanFailDes=0xC000 (target seen, exact BSSID, fail mask 0)
+LinkIndUp=2 LinkIndDown=1 LeaveNetCalls=1        LqmPosts=15 LqmBeaconStall=0
+SkywalkStage=11 QueuesEnabled=4     TxFrames=368 RxFrames=298 TxDequeue=394 RxFree=148
+RxFallbackDrops=0 RxNoBuf=0 TxComplFail=0 RxComplFail=0       inet 192.168.87.154, status: active
+IcSizeHal == IcSizeNet == 6664      LlAddrCalls=3 Synced=3 Late=0
+MgtqKicks=2                         <- mechanism 19 still carrying every join, one kick each
+```
+
+**Both joins and the teardown are textbook**, so the association path, the WCL ioctl chain, the
+data path and the link-address sync are all confirmed working on the release the machine actually
+runs. What is *not* working is visible in the same capture: auto-join (mechanism 13), the
+`networksetup` association report (17) and the LQM rate group (20).
+
+**`ItlwmLlAddrLate = 0` — mechanism 23 has still never been observed**, across a session with three
+address changes. It remains theoretical and should be demoted rather than built.
+
+### BOOT 1 IS DONE — 26.6.2 (25G83), new kext, `itldefer=30`, no panic
+
+Everything above booted. `scripts/kextuuid.py --expect` confirmed the new UUID loaded. Results, and
+five entries moved by them:
+
+| read | value | what it settles |
+| --- | --- | --- |
+| `ItlwmSkywalkStage` / `QueuesAdded` / `QueuesEnabled` / `RegRet` / `RxPrimeRet` | 11 / 4 / 4 / 0 / 0 | no regression from any deletion; data path identical to the pre-cleanup kext |
+| `ItlwmRegInfoLentNet` / `LentEth` | **0 / 0** | mechanism 1's loan is provably dead and is now deletable |
+| `ItlwmPrepareBSDUngated` | 0 | mechanism 12's wrapper never takes the ungated path |
+| `updateMacAddress` | `00:00:00:00:00:00 -> 4E:44:5B:84:76:CD` | **mechanism 21's fix works** — card MAC + the LAA bit, XOR `02:...`, not a random address |
+| `ItlwmPublishRootMediaMs` / `QuietMs` / `AtMs` | 66 / 17718 / 30000 | mechanism 7 answered — and the personality gate refuted as a *replacement* |
+| `ItlwmIctPaddrLo` | `0x5a514000`, `& 0xfff == 0` | **mechanism 4's misaligned-IOVA root cause is REFUTED** |
+| `ItlwmInitMark` / `PreSleepInitComplete` | 7 / 0 | mechanism 8's failure mode is not occurring on a healthy boot |
+| `ItlwmIcSizeHal` == `IcSizeNet` | 6664 | no stale-object-file corruption |
+
+Unchanged and still broken, as expected — nothing in this pass touched them: `ItlwmAssocCalls = 0`
+with `ScanBeacons = 1283`, i.e. auto-join still never gets a candidate list (mechanism 13).
+
+### Next steps, in order
+
+1. **DONE — booted once, unchanged, at `itldefer=30`.** See the table above.
+1b. **DONE — mechanism 1's loan is deleted.** `gItlwmLentNetRegInfo`, `gItlwmLentEthRegInfo`,
+   `ITLWM_REGINFO_MTU_OFFSET`, `reclaimLentRegistrationInfo` and its three call sites, and both
+   counters are gone. `prepareBSDInterface` keeps only the `copyRegistrationInfo` call that makes
+   the ethernet field non-NULL in the first place. `deregisterLogicalLink` is retained as a
+   deliberate define-and-forward slot pin, documented at the site. **UNBOOTED** — but the code it
+   removes was measured never to execute, so the risk is that the *removal* is wrong rather than
+   that the behaviour changes. Re-verified: 211 + 45 / 0 wrong, 94 slots / 0 wrong, 956 symbols /
+   0 missing, all ten targets.
+2. **DONE — the deferral is deleted.** `-itlnodefer` booted **5/5** on build `D9328681`, and the
+   evidence that carries the decision is the mechanism, not the tally: every row of the old hang
+   record is confounded by a fault since fixed. `IOPCIEDeviceWrapper` is back to upstream apart
+   from the `msiCap`/`msixCap` fix; `itldefer`, `-itlnodefer`, `-itlwaitpub` and the six
+   `ItlwmPublish*` properties are gone, and five external symbols left the link surface (956 →
+   951). **UNBOOTED as a deletion** — the code removed was measured never to matter, so the risk is
+   that the removal is wrong rather than that behaviour changes. Mechanism 7 is CLOSED.
+2b. **`IOResourceMatch` may be an OSString or an OSDictionary and nothing else** — the array form
+   was rejected (`Can't match using: OSArray`), failed open, and silently disabled the pre-existing
+   `IOBSD` gate. Reverted; the Tahoe plist is byte-identical to HEAD again.
+3. ~~Read `ItlwmIctPaddrLo` and `ItlwmPreSleepInitComplete`~~ — **done, both above.** Mechanism 4
+   needs a new hypothesis; mechanism 8 is latent, not active.
+4. **Then the functional gaps** — see the ordering note below.
+
+### Deliberately NOT removed, so it is not re-proposed
+
+- **Upstream, out of scope** (present at `53c51c2`): `getProvider`'s faked provider (6), the
+  duplicated `initRegistrationInfo` and the unchecked `fNetIf->start()` on pre-Tahoe targets (11),
+  the `prepareBSDInterface` call site (12), the 100 ms scan timer (13), the dropped wait loop (8),
+  `-novht` / `-noht40` / `itlwm_cc`.
+- **Load-bearing:** the RX tee, `drainStrandedMgmtFrames` (19 — `ItlwmMgtqKicks` is non-zero on
+  every successful join, so it is carrying the driver), the gated `prepareBSDInterface` wrapper
+  (12 — a free recursive gate close whose removal risks a panic; `ItlwmPrepareBSDUngated = 0`
+  confirms it never takes the ungated path).
+- **Still the only evidence for an open mechanism:** every HAL marker in `ItlIwx.cpp`, including
+  the nine ICT counters that are provably 0. They come out with mechanisms 4 and 8, not before —
+  and boot 1 is the first boot that can read them.
+
 ## Tahoe bring-up: temporary mechanisms
 
 Everything here is deliberately unfinished — either a stopgap standing in for a real mechanism, or
@@ -387,13 +530,27 @@ kinds, and the distinction is what should drive priority:
   never reaches the air). One counter says whether it happens at all; read it before spending
   anything on it.
 - **Stopgaps that work but should not be permanent** — 1 (the legacy attach still exists beside the
-  Skywalk one, and the RX tee still lives in it; subsumes 10 and 12), 7 and 13 (timers standing in
-  for preconditions), 14, 19 (a 1 Hz retry carrying every association), 3, 4, 6, 8, 11.
-- **Cleanup owed once the above settle** — 9 (remove all instrumentation), 2 (delete the dead
-  event-pipe guards), 16 (finish decoding `apple80211_assoc_candidates`).
+  Skywalk one, and the RX tee still lives in it), 7 and 13 (timers standing in for preconditions),
+  14, 19 (a 1 Hz retry carrying every association), 3, 4, 6, 8, 11, 12.
+- **Cleanup owed once the above settle** — 16 (finish decoding `apple80211_assoc_candidates`).
 
 Note 16 is *not* cosmetic even though 15 is closed: an unread flag byte in a struct Apple writes is
 an unread instruction, and the last one found there was the PSK.
+
+**2, 9 (the panic-trap half) and 10 are CLOSED and their code is deleted.** What that removed, so
+nobody goes looking for it: the `ItlwmTrace` ring and its four boot-arg panic traps, the six
+CoreCapture bisection boot-args, `forceWiFiSubfamily`, the event-pipe guards, and with them four
+release-pinned raw offsets (`ifnet +0x228/+0x22c`, `ifnet +0x280`, `ITLWM_SKYIF_STATE/EVTSRC`).
+Two of those traps **defaulted to armed**; see mechanism 9.
+
+**Scope note for whoever picks this up next, because it was got wrong once.** Several entries here
+describe behaviour that predates the Tahoe work and is present verbatim at `53c51c2`: mechanism 6
+(`getProvider` faking the provider), mechanism 11 (both halves), mechanism 12's stated call site,
+mechanism 13's 100 ms timer, and mechanism 8's dropped wait loop. Those are in scope for *repair*
+and out of scope for *deletion* — check `git diff 53c51c2 HEAD -- <file>` before removing anything
+this list calls temporary. Genuinely introduced by this work: the `RegistrationInfo` loan, the RX
+tee, the gated `prepareBSDInterface` wrapper, `drainStrandedMgmtFrames`, the Tahoe scan entry point,
+every `ITLWM_*_OFFSET`, and every `Itlwm*` counter.
 
 1. **Skywalk registration is faked.** `AirportItlwmSkywalkInterface::prepareBSDInterface` has
    Apple allocate the ethernet `RegistrationInfo` via `copyRegistrationInfo`, and permanently
@@ -1535,19 +1692,43 @@ an unread instruction, and the last one found there was the PSK.
    `ifconfig -l` showing **one** interface remains the cheap sanity check that no stray
    nexus-backed ifnet was published.
 
-   **Done when** no `gItlwmLent*RegInfo` static remains, and 10 and 12 are gone with it.
+   **THE LOAN IS NOW PROVABLY DEAD AND IS DELETABLE.** First boot carrying the counters
+   (26.6.2 / 25G83): **`ItlwmRegInfoLentNet = 0` and `ItlwmRegInfoLentEth = 0`**, with
+   `ItlwmSkywalkStage = 11` and `RegRet = 0`. So Apple's registration allocates both
+   `RegistrationInfo` structs before `prepareBSDInterface` ever runs, and neither lend branch is
+   reached. That is the evidence this entry has been waiting on — the comment in the code claiming
+   "no equivalent exists" for the network side was true before real registration landed and is
+   false now.
+   **DONE, unbooted.** `gItlwmLentNetRegInfo`, `gItlwmLentEthRegInfo`, `ITLWM_REGINFO_MTU_OFFSET`,
+   `reclaimLentRegistrationInfo` and its three call sites, and both counters are gone. The
+   `prepareBSDInterface` override stays — it is what calls `copyRegistrationInfo` on the ethernet
+   side, which is what makes that field non-NULL in the first place — and `deregisterLogicalLink`
+   stays as a define-and-forward slot pin.
+   **`ItlwmPrepareBSDUngated = 0` on the same boot**, so mechanism 12's wrapper is confirmed never
+   to take the ungated path.
+
+   **Done when** was "no `gItlwmLent*RegInfo` static remains, and 10 and 12 are gone with it".
+   The statics are gone and 10 is closed; 12 is deliberately kept (see its entry).
    → `include/Airport/AGENTS.md`, `AirportItlwm/AGENTS.md`
 
-2. **RESOLVED — the event-pipe guards are now dead code.** `createEventPipe` /
-   `destroyEventPipe` refuse when `state[0xa8]` is NULL, because Apple dereferences that field
-   unchecked in both. The real cause was `IO80211InfraInterface::start` returning false, and that
-   is fixed: measured on 26.6, `ItlwmSkyIfStarted = 1`, `ItlwmSkyIfHasEvtSrc = 1`,
-   `ItlwmEventPipeCalls = 17` and `Destroys = 13` with `Refused = 0` and `DestroysRefused = 0` —
-   the pipes are being created and destroyed for real, and the guards never fire. The stated
-   "Done when" is therefore met. *Remaining work:* delete both guards, `itlwmSkyIfEvtSrc`, the
-   `ITLWM_SKYIF_*_OFFSET` constants and the four `ItlwmEventPipe*` counters; they are raw offsets
-   valid for 26.6 only, so leaving them is a liability, not insurance. Keep them until a second
-   clean boot confirms the zeros. → `AirportItlwm/AGENTS.md`
+2. **DONE — the event-pipe guards and the whole `ITLWM_SKYIF_*` raw-offset apparatus are gone.**
+   `createEventPipe`/`destroyEventPipe` are no longer overridden at all, and with them went
+   `itlwmSkyIfEvtSrc`, `ITLWM_SKYIF_STATE_OFFSET`, `ITLWM_SKYIF_EVTSRC_OFFSET`, the ten-rung
+   `kItlwmSkyIfLadder` state probe and the six `ItlwmSkyIf*` / `ItlwmEventPipe*` properties.
+
+   **What made that safe is a different edit, and the two must not be separated:**
+   `AirportItlwmV2::start` now treats a false from `fNetIf->start()` as **fatal** on Tahoe. The
+   guards existed because a half-started interface leaves Apple's `state[0xa8]` NULL and both pipe
+   entry points dereference it unchecked — but the only way to reach that state was to ignore
+   `start()`'s return, which this driver did. Checking it removes the state instead of guarding it,
+   and removes two release-pinned offsets with it. The check is Tahoe-only: pre-Tahoe releases keep
+   upstream's bare `fNetIf->start(this);`.
+   **If anyone ever weakens that check back to a bare call, the guards have to come back.** The
+   comment at the call site says so.
+   *Nothing here needs a boot.* `ItlwmEventPipeRefused`/`DestroysRefused` read 0 on the boots that
+   existed, and the offsets they used are now not read at all, which is strictly less exposure than
+   guarding with them. `mapdrv.py` drops from 213 to **211** correct overrides — exactly the two
+   deleted — with 0 wrong.
 
 3. **Latent mis-bindable vtable slots — and this one is no longer hypothetical.** Only 240/241 of
    `AirportItlwmEthernetInterface` are pinned; the other 18 inherited slots whose method name an
@@ -1571,9 +1752,35 @@ an unread instruction, and the last one found there was the PSK.
 
 4. **ICT is disabled on `iwx`.** `iwx_post_alive` no longer enables it, because the table was
    never written — not one of 203 interrupts. *Real fix:* root-cause the dead table.
-   `ItlwmIctPaddrLo & 0xfff` (a misaligned IOVA truncated by `paddr >> 12`) and `ItlwmIctTblReg`
-   are published and need one surviving boot to read. **Done when** the cause is known and ICT
-   either works or the divergence is justified in place. → `itlwm/AGENTS.md`
+
+   **Two corrections that change what to do next.**
+   - **The markers were unreadable by construction.** `ItlwmIctPaddrLo` / `ItlwmIctTblReg` are
+     sampled unconditionally in `iwx_post_alive` (`ITLWM_ICT_OFF`), but they were published only
+     from `publishPreinitMark`, which runs only when `fHalService->attach()` **fails**. Attach
+     succeeds on every current boot, so "need one surviving boot to read" could never be satisfied.
+     They are now also published from `publishRuntimeCounters`; see mechanism 9.
+   - **MEASURED AND REFUTED OUTRIGHT: the ICT IOVA is page-aligned.** First boot that could read
+     it (26.6.2 / 25G83): `ItlwmIctPaddrLo = 0x5a514000`, so `& 0xfff == 0` and
+     `>> IWX_ICT_PADDR_SHIFT` loses nothing. `ItlwmIctTblReg = 0`, i.e. `CSR_DRAM_INT_TBL_ENABLE`
+     is clear, consistent with ICT being off. **So the misaligned-IOVA story for the dead table is
+     wrong and the cause is once again unknown.** Do not re-derive it; look elsewhere.
+   - **"Just align the allocation" is REFUTED for a second, independent reason — the request is
+     already 4096.** `ItlIwx.cpp` passes
+     `1 << IWX_ICT_PADDR_SHIFT` to `iwx_dma_contig_alloc`, byte-identical to `hal_iwm` and to
+     OpenBSD's `iwm`. It reaches only the 6-argument `IODMACommand::withSpecification`, whose
+     alignment parameter lands in `fAlignMask`. XNU carries **three** alignment fields —
+     `fAlignMask`, `fAlignMaskLength`, `fAlignMaskInternalSegments` — and only the `SegmentOptions`
+     overload sets all three; the 6-argument factory leaves the other two at their defaults. So the
+     4096 constrains the wrong thing, and nothing checks the IOVA that comes back: the shift by
+     `IWX_ICT_PADDR_SHIFT` is unconditional. Read `ItlwmIctPaddrLo & 0xfff` on the next boot before
+     touching the allocator.
+
+   Note `iwx_ict_reset` now has **no callers**, so `IWX_FLAG_USE_ICT` is never set and the nine
+   `ItlwmIct{Zero,Reset}*` counters are provably 0 forever. Only `IctPaddrLo` and `IctTblReg` carry
+   information; the rest come out with this entry.
+
+   **Done when** the cause is known and ICT either works or the divergence is justified in place.
+   → `itlwm/AGENTS.md`
 
 5. **CLOSED — `enable`/`disable(IO80211SkywalkInterface *)` compiled out for `__MAC_26_0` is
    harmless.** Tahoe dropped those overloads; `setPOWER` is pure virtual in Tahoe's
@@ -1589,18 +1796,65 @@ an unread instruction, and the last one found there was the PSK.
    narrow it to the caller that needs it, or remove it and address the IOSkywalkFamily cast
    panic it was written for. → `AirportItlwm/AGENTS.md`
 
-7. **`itldefer` is a timer standing in for a precondition.** `IOPCIEDeviceWrapper::start`
-   defers `registerService()` via a `thread_call`, which delays everything downstream past the
-   boot-time IOKit matching storm and the root filesystem mount. It is required on Tahoe — a
-   single CCPipe created before `super::start()` hangs the boot reliably — but *why* it works
-   was never established; the comment says so outright. **A timer is a race.** The documented
-   default is 1 s and bring-up is being run at `itldefer=30`, which is itself evidence that 1 s
-   is not enough and that nobody knows what the real margin is. *Leading hypothesis:* what it
-   actually waits for is the root filesystem being mounted, because that is what CoreCapture
-   needs before a CCPipe can be created. *Real fix:* identify the true precondition and wait on
-   it — a matching notification or an explicit dependency — instead of a wall-clock delay.
-   **Done when** `-itlnodefer` boots, or the wait is on something deterministic.
-   → `AirportItlwm/AGENTS.md`, `include/Airport/AGENTS.md` (the bisection)
+7. **CLOSED — the deferred publish is deleted; `IOPCIEDeviceWrapper` is back to upstream.**
+   `itldefer`, `-itlnodefer`, `-itlwaitpub`, `publishLater`, `waitForPublishPreconditions`,
+   `itlwmElapsedMs`, the three `fPublish*` members, the six `ItlwmPublish*` properties and the
+   `stop()` teardown block are gone. `IOPCIEDeviceWrapper.hpp` is now byte-identical to `53c51c2`
+   and the `.cpp` differs only by the `msiCap`/`msixCap` uninitialised-read fix. Five external
+   symbols left the link surface with it (`waitQuiet`, `waitForMatchingService`,
+   `resourceMatching`, `getServiceRoot`, `clock_interval_to_absolutetime_interval`): 956 → 951.
+
+   **Why it was safe to delete, in the order the evidence actually carries weight.**
+
+   1. **The mechanism.** Every row of the hang record that justified the deferral is confounded by
+      a fault found later and since fixed — the unconditional `"No ivars->_faultReporter"` panic
+      under `-itlmincc`, slot 432 returning a bare `CCStream` under `-itlccowner`, and the slot
+      instrumentation that `include/Airport/AGENTS.md` records as hanging roughly half of all boots
+      on its own. There was never surviving evidence that creating a `CCPipe` early hangs anything.
+   2. **The measurement**, which is what made the timer indefensible rather than merely suspect:
+      `boot-uuid-media` is satisfied **66 ms** after `IOPCIEDeviceWrapper::start()` and the registry
+      goes quiet at **17.7 s**, while the machine was publishing at **30 s**. A wall clock that
+      nobody could tie to either milestone is a race, not a precondition.
+   3. **The record**, as corroboration only: `-itlnodefer` booted **5 / 5** on 26.6.2 (25G83),
+      build `D9328681` — 00:15, 00:30, 00:34, 00:44, 00:52 on 2026-08-23. Every boot reached
+      `AirportItlwmStage = 12`, `ItlwmCCPipeOK = 1`, `ItlwmSkywalkStage = 11`, `QueuesEnabled = 4`,
+      `CCPipesStarted = 3` / `StartFail = 0`, `IcSizeHal == IcSizeNet`, no panic.
+      The first of those five carried the rejected `IOResourceMatch` **array**, which fails open —
+      so it had *no resource gate at all* and published at the earliest possible instant. The most
+      aggressive variant is inside the passing set, not outside it.
+
+   **Do not read 5/5 as proof on its own.** Against the ~40% hang rate of the configuration this
+   replaced, five clean boots in a row is ~8% likely by luck — unlikely, not decisive. The
+   mechanism in (1) is the load-bearing argument; the boots corroborate it.
+
+   **A personality gate was tried and is NOT available**, which is worth keeping because the trap
+   is reusable. `IOService::checkResource` accepts only an **OSString or an OSDictionary**; an
+   OSArray produces `<class>: Can't match using: OSArray` and **fails open**, silently disabling
+   any previously-working entry. All **61** `IOResourceMatch` entries in the boot collection are
+   `<string>`, and an XML plist cannot express an OSSet, so a personality gates on exactly one
+   resource. The kernel's own `('IOBSD','boot-uuid-media')` array at `IOFindBSDRoot+0x2c8` is not a
+   counter-example: it is a *matching dictionary* for `waitForMatchingService`, parsed by
+   `IOResources::matchPropertyTable` — a different consumer with different type rules.
+   **Rule: the same property name can be read by two consumers with different type rules.** Confirm
+   which function will parse *your* copy before transplanting a spelling out of the kernel.
+
+   **Also refuted along the way, so none of it is re-proposed:** `CCCapture`/`CCPipe` as a gate
+   (published *by* `CCPipe::allocCapture`, so a consequence of the thing being gated, and
+   `CCPipe::initWithOwnerNameCapacity` touches no filesystem at all); `boot-uuid`
+   (`publishBootMediaAndTerminate` removes it, so a gate on it matches once and never again);
+   `OSKextReceiptQueried` / `IOConsoleUsers` / `WindowServer` (userspace- or login-dependent —
+   gating Wi-Fi on login breaks the login window); `IOMatchDefer` (the userspace-reboot re-match
+   mechanism); and moving `initCCLogs()` late (Apple's `start()` hard-requires a non-NULL
+   `getLogger()` at +0x17e and the fault-reporter chain at +0x272, so "when the pipes are built" is
+   not separable from "when `AirportItlwm::start()` runs").
+
+   **Hazard recovered while sizing this and worth keeping even though the code is gone:**
+   `waitQuiet(uint64_t)` tail-calls `waitQuietWithOptions`, which loops up to **four** times when
+   the timeout is ≥ ~41 s (`cmp` against `0x4c5e52d` on `timeout >> 9`) — a 60 s request is a 240 s
+   stalled boot. That function also carries a `panic()` gated on `gIOKitDebug` bit 23
+   (`kIOWaitQuietPanics`) **and** `options & 1`; `sysctl -n debug.iokit` reads `8388608` on this
+   machine, so the bit is SET and the only thing keeping it unreachable is that `waitQuiet(uint64_t)`
+   hardcodes `options = 0`. **Never call `waitQuietWithOptions(..., 1)` from this driver.**
 
 8. **`iwx_run_init_mvm_ucode` dropped upstream's wait loop.** OpenBSD retests the condition:
    `while ((sc->sc_init_complete & wait_flags) != wait_flags) { tsleep_nsec(...); }`. This port
@@ -1613,28 +1867,80 @@ an unread instruction, and the last one found there was the PSK.
    can be restored given this port's `tsleep`/`wakeupOn` locking discipline (the shim does not
    hold the lock the sleeper sleeps on, which may be why it was dropped), then restore it or
    justify the divergence in place. **Done when** the loop is back or the reason it cannot be
-   is written at the site. → `itlwm/AGENTS.md`
+   is written at the site.
+   **Scope: this divergence is UPSTREAM, not introduced by the Tahoe work** — the commented-out
+   loop is unchanged context in `git diff 53c51c2 HEAD`, and `hal_iwm/fw.cpp` carries the identical
+   shape with its own unused `wait_flags`, so it is a port-wide idiom rather than a local slip.
+   That makes it in scope for repair and out of scope for deletion.
+   `ItlwmPreSleepInitComplete` is now published on surviving boots too (mechanism 9), so the
+   lost-wakeup-versus-never-arrived question is finally answerable without an attach failure.
+   **First such boot (25G83): `ItlwmInitMark = 7`, `ItlwmInitErr = 0`, `PreSleepInitComplete = 0`.**
+   Mark 7 is not the timeout exit (5), so `iwx_run_init_mvm_ucode` completed normally and **the
+   failure mode this entry describes is not occurring on a healthy boot at all.** That does not
+   make the divergence safe — a single unconditional `tsleep_nsec` still cannot distinguish a
+   spurious wakeup from a real one, and the unused `wait_flags` still marks the removal — but it
+   does mean this is latent rather than active, and it should be prioritised accordingly.
+   → `itlwm/AGENTS.md`
 
-9. **All bring-up instrumentation comes out.** HAL markers, the `ItlwmTrace` ring and its four
-   traps, `ItlwmMarkRef`, and the ioreg properties. Remove wholesale once Tahoe boots reliably.
+9. **Bring-up instrumentation: the panic-trap half is GONE, the HAL half stays until 4 and 8 close.**
+
+   **Removed.** The whole `ItlwmTrace` ring, `ItlwmMarkRef`, `ItlwmTraceTrap`, `ItlwmIfnetTrap`,
+   `ItlwmCmdTrap`, the boot-args `itlprovtrap` / `itlmarktrap` / `itlifnettrap` / `itlcmdtrap`, the
+   raw `ifnet + 0x280` read, the hardcoded vtable indices 241/291, and the properties
+   `ItlwmTraceCount` / `ItlwmGetProvCount` / `ItlwmGetProvFaked`. The NX fault they were built to
+   catch is root-caused and fixed (a loader mis-bind of slot 241, pinned by overriding it — see
+   `include/Airport/AGENTS.md`), so every one of them was answering a closed question.
+
+   **`itlprovtrap` and `itlmarktrap` DEFAULTED TO ARMED, not to 0** — `? (int)n : 1` and `: 5`. A
+   shipping kext therefore carried two live `panic()` triggers whose only protection was that
+   `gItlwmAttachSeen` / `isAttach` are set inside `AirportItlwmEthernetInterface::
+   attachToDataLinkLayer`, which never runs on Tahoe because that interface is attached
+   unregistered. The traps were one architectural decision away from panicking the machine, and
+   nothing said so.
+   **Rule: a diagnostic whose default is "armed" is not a diagnostic, it is a landmine.** When a
+   trap is added, its disarmed state must be the one you get by typing nothing, and the removal
+   date belongs in the same edit.
+
+   **Also removed:** the CoreCapture bisection knobs `-itlnocc`, `-itlmincc`, `-itlccowner`,
+   `itlccsize`, `-itlnostart`, `-itlnohal` and their six properties. That investigation is closed
+   (`include/Airport/AGENTS.md`, "RESOLVED: the Tahoe boot hang was the `-itlmincc` panic"), Apple's
+   own `ccpipe:<PipeName>` boot-arg is the better tool for the one experiment still worth running,
+   and `-itlmincc` is on record as a mode that invalidated every result taken under it. Pipe size is
+   now the constant `ITLWM_CC_PIPE_SIZE`; `ITLWM_CC_NOTIFY` still derives the notify threshold from
+   it so the two cannot drift apart.
+
+   **Kept, and now finally readable.** The HAL markers in `ItlIwx.cpp` are the sole evidence for
+   mechanisms 4 and 8, both still open. They had a defect of their own: `publishPreinitMark` is
+   called from exactly one site, inside the `if (!fHalService->attach(pciNub))` **failure** branch,
+   so on every boot where the driver works none of them was ever published — and both mechanisms'
+   "Done when" is "read this on one surviving boot", which was impossible by construction. They are
+   now republished from `publishRuntimeCounters` on the `AirportItlwm` node as well.
+   **Rule: a counter published only from a failure path cannot close a question about success.**
+   This is the second time the same defect has been found in this file's counters; grep for any
+   other `setProperty` reachable only from an error branch before adding a new one.
+
+   **Done when** mechanisms 4 and 8 close and the HAL markers go with them.
    → `itlwm/AGENTS.md`, `AirportItlwm/AGENTS.md`
 
-10. **The ifnet's Wi-Fi subfamily is written by hand.**
-    `AirportItlwmEthernetInterface::forceWiFiSubfamily` pokes `IFNET_SUBFAMILY_WIFI` straight
-    into `ifnet+0x22c` after `attachToDataLinkLayer`, because no IONetworkingFamily API reaches
-    that field and without it `_if_functional_type` reports the interface as `WIRED`. Raw
-    offsets, valid for 26.6 only, guarded by a family-word check that skips the write if the
-    layout does not match. *Real fix:* subsumed by 1 — Apple's Wi-Fi drivers get the subfamily
-    from the Skywalk path's virtual `getInterfaceSubFamily()`, which needs a real registration.
-    **Done when** no `ITLWM_IFNET_*_OFFSET` constant remains.
-    → `AirportItlwm/AGENTS.md`
+10. **DONE — the hand-written ifnet subfamily poke is gone.** `forceWiFiSubfamily` and
+    `ITLWM_IFNET_FAMILY_OFFSET` / `ITLWM_IFNET_SUBFAMILY_OFFSET` are deleted, together with the four
+    `ItlwmIfnet*` properties. The replacement is `RegistrationInfo + 0x0c`, seeded in
+    `registerSkywalkInterface` — the route Apple's own Wi-Fi drivers take, applied before the ifnet
+    exists instead of patched after it, and measured working (`ifconfig -v en3` reports
+    `type: Wi-Fi`, `SIOCGIFFUNCTIONALTYPE = 3`, `airportd` enumerates the interface).
+    The poke was additionally dead on Tahoe regardless: its only caller,
+    `AirportItlwmEthernetInterface::attachToDataLinkLayer`, never runs there.
+    **Done when** was "no `ITLWM_IFNET_*_OFFSET` constant remains" — met.
 
-11. **`AirportItlwmV2::start` ignores `fNetIf->start()`'s return value.** It now *succeeds*
-    (`ItlwmSkyIfStarted = 1`), so this is no longer masking a live failure — but it masked the
-    single most consequential failure of this bring-up for weeks, while 2 and the scan path were
-    investigated as separate problems. Check the return and treat a false as fatal, or at minimum
-    record it, so the next regression is attributed on the first boot instead of the tenth. It
-    also calls `fNetIf->initRegistrationInfo` twice with identical arguments.
+11. **PARTLY DONE — `fNetIf->start()`'s return is now checked on Tahoe; the duplicate
+    `initRegistrationInfo` is left alone deliberately.**
+    Both halves of this entry are **upstream**, present verbatim at `53c51c2`, not introduced by the
+    Tahoe work. That changes what may be done to them: the return check is a Tahoe-scoped *fix*
+    (it is what let mechanism 2's raw-offset guards be deleted, so it is load-bearing, not tidying),
+    while the duplicated call is an upstream copy-paste that every V2 release ships and that this
+    work has no reason to touch. It is idempotent — `initRegistrationInfo` fills the caller's struct
+    from getters and has no effect on `this` — so it costs nothing but a line.
+    **Done when** the duplicate is removed upstream, or the pre-Tahoe targets adopt the same check.
     → `AirportItlwm/AGENTS.md`
 
 12. **`prepareBSDInterface` is gated by hand.**
@@ -1652,12 +1958,34 @@ an unread instruction, and the last one found there was the PSK.
     establish that context itself. Once registration is real, Apple's own path calls the hook
     gated and this wrapper is dead weight — a recursive close that still works and no longer means
     anything, which is the dangerous kind of leftover.
+
+    **Scope correction: the call site named in the "Done when" is UPSTREAM.**
+    `interface->prepareBSDInterface(getIfnet(), 0)` in `attachToDataLinkLayer` is present verbatim
+    at `53c51c2`; only the gated wrapper around `super` is ours. So the literal Done-when is not
+    ours to satisfy by deleting that line. On Tahoe it is already moot at runtime —
+    `attachToDataLinkLayer` never executes there, because the ethernet interface is attached
+    unregistered — which means the only live caller is already Apple's gated one and the wrapper is
+    already a recursive no-op.
+    **Kept anyway, on purpose.** `IO80211WorkQueue::runAction` on a gate this thread already holds
+    is free, while removing it is a one-way bet whose losing side is
+    `IO80211Glue::sendIOUCToWcl` panicking `"trying to send on thread panic"`. `ItlwmPrepareBSDUngated`
+    is the counter that would say the wrapper ever mattered; it must stay 0.
     **Done when** `attachToDataLinkLayer` no longer calls `prepareBSDInterface` itself; at that
     point delete the wrapper, `superPrepareBSDInterface`, `gatedPrepareBSDAction` and
     `ItlwmPrepareBSDUngated` together with the `RegistrationInfo` loan they sit beside.
     → `AirportItlwm/AGENTS.md`
 
-13. **Scan completion is a fixed 100 ms timer.** `AirportItlwmSkywalkInterface::beginScanGated`
+13. **Scan completion is a fixed 100 ms timer — and it is what stops auto-join, measured.**
+    On 25G83 with no network joined, `SCAN_MANAGER` cycles `IDLE -> IN_PROGRESS -> SCAN_COMPLETE`
+    roughly **ten times a second**, forever, and `airportd` receives `scanResultsCount=0` on **38 of
+    52** samples (the rest 1–4, once 17) while the driver had pushed `ItlwmScanBeacons = 2108`. So
+    the beacons are there and the reports are empty: the timer fires before the node cache has
+    filled, the WCL immediately re-requests, and auto-join never gets a candidate list. A manual
+    join works first time from the same state, which is what isolates this to scan *reporting*
+    rather than scan or association.
+    **That makes this the highest-value open stopgap for a user, not a latent one** — it is the
+    difference between Wi-Fi that connects itself and Wi-Fi you have to join by hand.
+ `AirportItlwmSkywalkInterface::beginScanGated`
     starts a net80211 background scan, arms `scanSource` for 100 ms, and then reports the scan
     complete regardless of what the scan is doing. So a "scan" is really "wait 100 ms, then report
     whatever the node cache already held". Inherited from the pre-Tahoe `setSCAN_REQ`, not
@@ -2063,12 +2391,43 @@ an unread instruction, and the last one found there was the PSK.
     → `AirportItlwm/AGENTS.md`
 
 17. **`networksetup` reports the interface as not associated on a working connection.**
-    `ifconfig en3` reports `active`, `NET_MANAGER` is in `LINK_UP`, and `airportd` resolves the
-    network, BSSID, channel and band — so the association state is right everywhere except in what
-    `networksetup -getairportnetwork` reads. That makes it a **getter gap, not a state problem**,
-    and the same class as the four stubbed getters that gated the join: read the log for the first
-    `kIOReturnUnsupported` on that path rather than guessing. `getBEACON_INFO` (346) is the loudest
-    remaining refusal there, polled a few times per connection and currently stubbed.
+    Reproduced live on 26.6.2 (25G83) with the pre-cleanup kext, on a connection that is working in
+    every other respect:
+
+    ```text
+    ifconfig en3        status: active   inet 192.168.87.154
+    system_profiler     Status: Connected, Current Network Information: <network>, 802.11ac,
+                        channel 44 (5GHz, 80MHz), WPA2 Personal, Transmit Rate: 260, MCS Index: 3
+    WCL FSM             JOIN_MANAGER IDLE->IN_PROGRESS->ASSOC_DONE->CONNECT_COMPLETE->IDLE
+                        NET_MANAGER  LINK_DOWN->WAITING_FOR_CONNECT_COMPLETE->WAITING_FOR_IP->LINK_UP
+                        ROAM_MANAGER LINK_DOWN->LINK_UP
+    networksetup -getairportnetwork en3   "You are not associated with an AirPort network."
+    ```
+
+    **So this is NOT a missing association getter, and the previous entry's suspect is refuted.**
+    `system_profiler SPAirPortDataType` goes straight to the driver and gets the network, the PHY
+    mode, the channel, the security *and* the rate. `getBEACON_INFO` (346) was named here as the
+    likely gate; it is refused only **6 times** in a ten-minute capture spanning two joins, while
+    the association is continuously correct everywhere else. It is not the mechanism.
+
+    **Also refuted, and worth recording because it looked compelling for ten minutes:** the kernel
+    logs `[ik] setSSID@1390: Attempt to overwrite valid SSID with (9,)` 829 times in that capture —
+    length 9 with an apparently empty name, at the scan-storm rate. `IO80211BSSBeacon::setSSID` is
+    the beacon path, so it reads like our `postScanBeacon` writing `ssid_len` without the bytes.
+    It is not. **`(9,)` is a REDACTED SSID** — macOS logs SSIDs as private data, which is why
+    `airportd` prints `network = <redacted>` and `system_profiler` prints `<redacted>` in the same
+    capture. And the message refutes itself: it says it already holds a *valid* SSID to overwrite,
+    which can only be true if an earlier `setSSID` stored real bytes. It is a benign no-op guard
+    logged at Notice level.
+    **Rule: before building a theory on an empty string in a log, check whether that subsystem
+    redacts.** Two subsystems in the same capture printed the same SSID one way and the other.
+
+    *Where to look next, in this order:* this is a **SystemConfiguration/CoreWLAN** question, not an
+    Apple80211 one — the third of the three independent questions in the adoption rule below.
+    `networksetup -getairportnetwork` resolves through CoreWLAN's `-[CWInterface ssid]`, and the
+    `[IOC DEBUG]` line for `APPLE80211_IOC_SSID` reads `res=<GOOD:0:0x0>` with `err=0` at the
+    `airportd` end, so the ioctl is answered. Capture what CoreWLAN actually receives rather than
+    what the kernel returns.
     **Done when** `networksetup -getairportnetwork en3` names the network while connected.
     → `AirportItlwm/AGENTS.md`
 
@@ -2089,7 +2448,13 @@ an unread instruction, and the last one found there was the PSK.
     a second of latency it should not. **Done when** a join completes with `ItlwmMgtqKicks = 0`,
     i.e. the frame leaves on the first `if_start`. → `itl80211/AGENTS.md`, `AirportItlwm/AGENTS.md`
 
-20. **The LQM payload is filled only as far as the keepalive needs.** `postLqmUpdate` sets the
+20. **The LQM payload is filled only as far as the keepalive needs.** *Confirmed live on 25G83*:
+    `[corewifi] LQM: txRate=0.0Mbps txFrames=0 txFail=0 txRetrans=0 rxRate=0.0Mbps rxFrames=4
+    beaconRecv=49 beaconSched=49` on a connection where `system_profiler` simultaneously reports
+    `Transmit Rate: 260, MCS Index: 3`. **The driver has the number and the rate group is simply
+    unflagged** — the two readings come from different paths, which is what makes this a payload
+    gap rather than a missing measurement, and what makes it cheap.
+ `postLqmUpdate` sets the
     counter group and the two master flags; the RSSI, SNR, CCA, channel and rate/frame groups are
     left with their validity bytes clear, which is *correct* rather than broken — the consumer skips
     an unflagged group instead of reading zeros. But it is visible: `airportd` reports
@@ -2114,6 +2479,43 @@ an unread instruction, and the last one found there was the PSK.
     - `AirportItlwmV2::start` no longer passes NULL as `IO80211SkywalkInterface::init`'s
       `ether_addr *`. That argument seeds `state[0xe4]`, which is the agent's initial address, so a
       NULL made the family invent a random one before any privacy setting was consulted.
+
+      **AND THAT HALF WAS A NO-OP UNTIL NOW — the override threw the argument away.**
+      `AirportItlwmSkywalkInterface::init(IOService *, ether_addr *)` declared its second parameter
+      *unnamed* and called `IO80211InfraInterface::init()`, the zero-argument form, which never
+      touches `state[0xe4]`. So the caller-side seeding shipped, was recorded as fixed, and changed
+      nothing. Fixed properly by calling the exported non-virtual
+      `IO80211SkywalkInterface::setInitMacAddress(ether_addr &)` — three instructions writing the
+      same field — after the base init succeeds. It is in **no vtable** (absent from every class
+      table in `scripts/abi/abi-26.6-25G72.txt`), so declaring it costs no slot.
+      Swapping the base call for the two-argument Skywalk init would be wrong: only the Infra one
+      allocates the expansion block at `this+0x128` that `registerInfraEthernetInterface`'s MAC-stamp
+      guard reads.
+      **BOOTED AND CONFIRMED WORKING (26.6.2 / 25G83).** The family's own log, one line, decisive:
+
+      ```text
+      updateMacAddress@288: role<Infrastructure> init<1> ... client<3>
+                            mac address changed = <00:00:00:00:00:00> -> <4E:44:5B:84:76:CD>
+      ```
+
+      The card is `4c:44:5b:84:76:cd`; the agent produced `4e:44:5b:84:76:cd`. **The XOR is
+      `02:00:00:00:00:00` and nothing else** — the family took our seeded address and set the
+      locally-administered bit, which is a derivation, not an invention. Compare the same line
+      before the fix: `<00:00:00:00:00:00> -> <E6:D3:46:D3:CF:FE>`, and a different random address
+      on every boot (`d6:38:59:1e:5a:bc`, `3a:b5:6e:3c:bf:38` were two others). The seed is
+      reaching `state[0xe4]`.
+
+      **Read the XOR, not the address.** `ifconfig en3 | grep ether` alone cannot settle this: with
+      Private Wi-Fi Address at its default *Fixed*, a locally-administered address is **correct**,
+      so "the interface shows an LAA address" is expected either way. What distinguishes a working
+      seed from a broken one is whether the address is *derived from the card's* (one bit differs,
+      stable across boots) or *invented* (all six octets differ, new every boot). An earlier version
+      of this note told the reader to check for the factory MAC verbatim; that test would have
+      failed on a correct fix.
+      **Rule: an override that drops a parameter is invisible at every level above it.** The caller
+      compiles, the family runs, the counters that were added all read as expected — because they
+      measure the *other* half of the fix. When a fix has two halves, instrument the half you are
+      not otherwise going to see.
     - `AirportItlwmSkywalkInterface::setLinkLayerAddress` (slot 335) overridden: it copies the
       family's chosen address into **both** `ic_myaddr` and `ac_enaddr` and then calls super, which
       is what publishes `IOMACAddress` and calls `ifnet_set_lladdr`. Our half runs first so the two

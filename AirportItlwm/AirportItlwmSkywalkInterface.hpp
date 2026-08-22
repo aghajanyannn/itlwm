@@ -52,15 +52,11 @@ public:
     // while the BSD stack advertises the assigned one — a working link that cannot complete DHCP.
     virtual IOReturn setLinkLayerAddress(ether_addr *) override;
 
-    // IO80211SkywalkInterface::createEventPipe dereferences state[0xa8] with no null check.
-    // start() records whether that field ever got populated; createEventPipe refuses rather
-    // than letting Apple fault on it.
+    // Overridden to hang the real Skywalk registration off a successful super::start().
+    // A false return is FATAL to AirportItlwmV2::start and must stay that way: super::start()
+    // is what allocates the per-interface state block that createEventPipe/destroyEventPipe
+    // and the rest of the family dereference without a NULL check.
     virtual bool start(IOService *) override;
-    virtual UInt64 createEventPipe(IO80211APIUserClient *) override;
-    // Same unchecked state[0xa8] dereference as createEventPipe. Must be overridden together
-    // with it: guarding only create lets adoption proceed to the point where airportd calls
-    // destroy, which then panics.
-    virtual void destroyEventPipe(IO80211APIUserClient *) override;
     // ---- Real Skywalk registration (root AGENTS.md mechanism 1) --------------------------------
     // Unconditional on Tahoe, and this IS the machine's Wi-Fi data path: the two pools and four
     // queues built here back the netif nexus that owns the BSD ifnet, and the TX/RX callbacks below
@@ -126,7 +122,6 @@ protected:
     IOSimpleLock               *fRxFreeLock;
 
 private:
-    void reclaimLentRegistrationInfo();
     // All three are non-virtual on purpose: they must add no vtable slot.
     // gatedSuperPrepareBSDInterface calls super::prepareBSDInterface with the interface work
     // queue's gate closed, which IO80211Glue::sendIOUCToWcl requires.

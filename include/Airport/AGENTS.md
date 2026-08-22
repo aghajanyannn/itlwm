@@ -442,7 +442,7 @@ Not one of them was a header error. The reconstruction has been correct througho
 failures were an allocator zone, a null field Apple never checks, and a loader bug.
 
 The attach failure was localised to **`iwx_preinit`**, the last call in `iwx_attach`. (That
-console evidence predates `itldefer`; with the defer in place `start()` runs after the GUI
+console evidence predates the deferred publish; with the defer in place `start()` ran after the GUI
 takes the console and nothing driver-side reaches a screen — see the root AGENTS.md.) With `debug=0x8`
 the console shows `ieee80211_ifattach`, a successful `ifnet_attach`, and the taskq
 creation that follow the ring setup — so PCI mapping, interrupt establishment, the
@@ -612,6 +612,16 @@ an address this kernel never programmed. Verified as *not* the cause of the atta
 
 ### Boot stability: judge configurations by their record, not by single boots
 
+**The boot-args below no longer exist.** `-itlnocc`, `-itlmincc`, `-itlccowner`, `itlccsize`,
+`-itlnostart` and `-itlnohal` are deleted; the bisection they served is closed and `-itlmincc` is on
+record as a mode that invalidated every result taken under it. The record is kept because it is what
+stops the refuted theories being re-followed, not because the flags can be re-run. Apple's own
+`ccpipe:<PipeName>` boot-arg (below) is the way to vary pipe size now, and it is better than
+`itlccsize` was because it needs no rebuild. **`itldefer`, `-itlnodefer` and `-itlwaitpub` are gone
+too** — the deferral they controlled was measured, then deleted after `-itlnodefer` booted 5/5, and
+`IOPCIEDeviceWrapper` is back to upstream. See root AGENTS.md mechanism 7, which is CLOSED.
+
+
 The hangs land at **four different boot phases** — USB enumeration, root mount, Ignition's
 config dump, and Ignition's cryptex graft. A specific defect hangs in a specific place; a
 hang that wanders like this is memory corruption or a broad race, where each build lands
@@ -622,17 +632,28 @@ longer looks causal.
 
 Records so far, which is the only trustworthy view:
 
-| configuration | pipes actually created | boots | hangs |
-| --- | --- | --- | --- |
-| `-itlnocc` (no CoreCapture at all) | 0 | **5** | 0 |
-| `-itlmincc itlccsize=64` | **0 — rejected** | 1 | 0 |
-| `-itlmincc` (one pipe + one stream) | 1 | 0 | 2 |
-| `-itlccowner` | 1 | 0 | 2 |
-| deferral, full CoreCapture | 3 | 2 | 3 |
+| configuration | pipes actually created | boots | hangs | **what has since been found to confound this row** |
+| --- | --- | --- | --- | --- |
+| `-itlnocc` (no CoreCapture at all) | 0 | **5** | 0 | proves only that *not running Apple's `start()`* is safe — a NULL logger fails at `createIOReporters` before anything interesting |
+| `-itlmincc itlccsize=64` | **0 — rejected** | 1 | 0 | the pipe was refused by the `min <= size` gate; nothing was tested |
+| `-itlmincc` (one pipe + one stream) | 1 | 0 | 2 | **panicked unconditionally** — no fault reporter, `findAndAttachToFaultReporter+0x10f` |
+| `-itlccowner` | 1 | 0 | 2 | same era: slot 432 returned a bare `CCStream`, so the family dispatched slot 36 on the wrong class |
+| deferral, full CoreCapture | 3 | 2 | 3 | same fault-reporter era, **and** carried the slot instrumentation this file records as hanging roughly half of all boots on its own |
 
-`-itlnocc` is the only clean record. Deferral genuinely helped — it moved hangs much later
-and allowed boots — but did not eliminate them. So **creating CoreCapture pipes at all is
-the destabiliser**, and deferral only lowers the odds.
+**READ THE LAST COLUMN BEFORE USING THIS TABLE. Every row is confounded by a fault that was
+found later and has since been fixed, so there is currently NO surviving evidence that creating
+a CCPipe early hangs anything.** The conclusion this table used to carry — "creating CoreCapture
+pipes at all is the destabiliser, and deferral only lowers the odds" — does not follow from data
+gathered under an unconditional panic plus an instrumentation bug.
+
+What that does **not** license is deleting the deferral on the spot: nobody has yet booted the
+*current* code — correct fault-reporter chain, slot instrumentation gone — without it. It moves
+`itldefer` from "required, mechanism unknown" to a fossil. It was disproved and deleted:
+`-itlnodefer` booted 5/5 on 26.6.2 (25G83), with all three `CCPipe`s created at the earliest point
+in boot. Root AGENTS.md mechanism 7 has the full closure.
+**Rule: a record table is only evidence if each row was gathered under one variable.** These were
+not, and the table read as independent evidence for months because the confounds were discovered
+one at a time and never propagated back into it.
 
 **Leading suspect: the pipe size.** `-itlmincc` creates exactly ONE pipe, with the upstream
 `pipe_size = 0x200000`, and still hangs — so a single 2 MB allocation this early is enough.
@@ -705,7 +726,7 @@ combination can reach Apple's `start()` without a reporter.
 Panic reports are written to `/Library/Logs/DiagnosticReports/*.panic` only once the
 filesystem is up. A panic before root mount leaves **no report and no panic UI** — the verbose
 console simply stops. That is why every early "hang" produced nothing on disk while the same
-panic at `itldefer=30`, firing after login, wrote a full report.
+same panic under the (since-deleted) 30 s deferral, firing after login, wrote a full report.
 
 It also explains the wandering hang site. The panic is at a fixed point in the driver's own
 timeline, but `start()` runs asynchronously against boot progress, so it lands wherever boot
@@ -715,8 +736,9 @@ before theorising, and treat their absence as evidence about timing, not about t
 
 #### RESOLVED: the Tahoe boot hang was the `-itlmincc` panic
 
-`itldefer=30` with full CoreCapture boots reliably and reaches `AirportItlwmStage = 9` with
-`ItlwmCCPipeOK = 1`. The boot problem is closed.
+A 30 s deferral with full CoreCapture booted reliably and reached `AirportItlwmStage = 9` with
+`ItlwmCCPipeOK = 1`. The boot problem is closed — and the deferral has since been deleted as well,
+because `-itlnodefer` booted 5/5 once the faults below were fixed.
 
 The whole investigation chased phantoms because the diagnostic flag itself was the fault.
 Successively blamed and cleared: CoreCapture pipe size, CoreCapture pipe creation, the
@@ -724,8 +746,9 @@ Successively blamed and cleared: CoreCapture pipe size, CoreCapture pipe creatio
 start()`'s LQM path, and the HAL firmware attach. **None of them was ever the cause.** Each
 "correlation" was really a correlation with `-itlmincc`, which panics unconditionally.
 
-Sequence that works: publish the nub late (`itldefer`), build full CoreCapture, let Apple's
-`start()` run. The remaining defect is the HAL attach failing cleanly — mark 6 / errno 35 —
+Sequence that works: build full CoreCapture and let Apple's `start()` run. Publishing the nub
+late was part of this sequence and turned out to be unnecessary once the fault reporter was
+correct; it is deleted. The remaining defect is the HAL attach failing cleanly — mark 6 / errno 35 —
 which is a timeout, not a crash, and is diagnosable from a running machine.
 
 Method notes worth more than the findings:
@@ -939,23 +962,24 @@ Ruled out, do not re-investigate:
 - **corecapture not being loaded.** It is a hard `OSBundleLibraries` dependency and is
   present in `kextstat` well before we run.
 
-**FIXED by deferring publication.** `IOPCIEDeviceWrapper::start()` now delays its
-`registerService()` (default **1 s**, the only value observed to boot, via `thread_call` so
-nothing blocks), which pushes
-`AirportItlwm::probe`/`start`, `initCCLogs()` and Apple's `IO80211Controller::start()` past
-the boot-time matching storm and the root mount — restoring the ordering every other target
-already has. **This is on by default on Tahoe and is required, not a tuning knob.**
-`-itlnodefer` disables it for A/B; `itldefer=<seconds>` overrides the delay.
+**"Creating any CoreCapture pipe before `super::start()` hangs the boot" is the claim the table
+above no longer supports** — every configuration behind it also carried an unconditional panic.
+Treat the paragraph below as the historical reasoning, not as a current finding.
 
-Confirmed: with the deferral the *full* original path runs — all three `CCPipe`s and both
-`CCStream`s, `ItlwmSkipCC = 0`, `ItlwmMinCC = 0` — with no hang, reaching `AirportItlwmStage
-= 9`. One second was enough (`PE_parse_boot_argn` writes 1 for a bare `-flag`, so the first
-successful test ran with a 1 s delay), so the race window is short.
+**FIXED by deferring publication — AND THAT FIX IS NOW DELETED, because the problem it fixed was
+not the problem.** `IOPCIEDeviceWrapper::start()` delayed its `registerService()` for a
+configurable number of seconds, which pushed `AirportItlwm::probe`/`start`, `initCCLogs()` and
+Apple's `IO80211Controller::start()` past the boot-time matching storm and the root mount. It was
+believed required. It is not: with the fault-reporter chain correct and the slot instrumentation
+gone, `-itlnodefer` boots — 5/5 on 26.6.2 (25G83) — and the whole apparatus has been removed.
+Before deleting it, it was made to measure what it had only ever been assumed to be waiting for:
+**`boot-uuid-media` at 66 ms, registry quiescence at 17.7 s, publishing at 30 s.** A wall clock
+that matches neither milestone is a race, not a precondition. Root AGENTS.md mechanism 7.
 
-The deferral also changes where a *remaining* failure shows up, which is a useful tell: the
-boot now reaches root mount, `launchd` and `Darwin Ignition` before anything of ours runs,
-so a hang there is our driver, not the storage stack. Do not read "hangs at Ignition" as a
-platform problem.
+While the deferral existed it changed where a *remaining* failure showed up — boot reached root
+mount, `launchd` and `Darwin Ignition` before anything of ours ran, so a hang there was ours rather
+than the storage stack. **That tell is gone with the deferral**: the driver now starts early again,
+so a stop site early in boot no longer rules itself out.
 
 Also refuted along the way: `-itlccowner`, which passes the fully-started provider as the
 `CCPipe` owner instead of the not-yet-started `this`, **hangs** exactly like the default.
@@ -967,8 +991,10 @@ instrumentation never caused anything: the boot hang was always present and mere
 timing-sensitive, so any code change shifted its odds. With the deferral in place that
 instrumentation is back in the tree.
 
-Read which flags took effect with
-`ioreg -n IOPCIEDeviceWrapper -l -w0 | grep -E "ItlwmSkipCC|ItlwmMinCC|ItlwmCCOwner|ItlwmDeferPublish"`.
+The deferral and its `ItlwmPublish*` measurements are deleted; there is nothing left to read here.
+What the measurement established, kept because it is the reason the timer could go: `boot-uuid-media`
+is published 66 ms after `IOPCIEDeviceWrapper::start()`, and `IOService::getServiceRoot()->waitQuiet()`
+returns at ~17.7 s, against a 30 s publish. Root AGENTS.md mechanism 7.
 
 Ruled out: `IO80211WorkQueue` inherits `addEventSource`, `removeEventSource`,
 `runEventSources` and `threadMain` from `IOWorkLoop` unchanged (slots 40, 41, 53, 36), so

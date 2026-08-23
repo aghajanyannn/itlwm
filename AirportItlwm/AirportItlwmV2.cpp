@@ -109,6 +109,9 @@ extern uint32_t gItlwmAliveMark;
 extern uint32_t gItlwmCmdKicks;
 extern uint32_t gItlwmCmdKicksAtHw;
 extern uint32_t gItlwmCmdLastCode;
+extern uint32_t gItlwmUcIntrAtWait;
+extern uint32_t gItlwmUcOkAtWait;
+extern uint32_t gItlwmUcWaitLoops;
 }
 extern "C" {
 extern uint32_t gItlwmPrepareBSDUngated;
@@ -489,7 +492,7 @@ static uint32_t sLastScanFailDes, sLastScanFailOr, sLastEssClears, sLastAssocEss
 static uint32_t sLastScanDoneEvents, sLastScanCompletes, sLastScanBackstops, sLastScanLastMs;
 // Mechanism 26.
 static uint32_t sLastRadioMark, sLastEnableCalls, sLastInitTaskCalls, sLastIwxStopCalls;
-static uint32_t sLastHwMark, sLastCmdKicks;
+static uint32_t sLastHwMark, sLastCmdKicks, sLastUcWaitLoops;
 static uint32_t sLastSetPowerOn, sLastSetPowerOff, sLastEnableAdapterCalls, sLastPmOffCalls;
 static uint32_t sLastIfFlags, sLastIcStateLive, sLastScFlagsLive;
 static bool sPublishedOnce;
@@ -582,6 +585,7 @@ void AirportItlwm::publishRuntimeCounters()
         (uint32_t)gItlwmRadioMark == sLastRadioMark &&
         gItlwmHwMark == sLastHwMark &&
         gItlwmCmdKicks == sLastCmdKicks &&
+        gItlwmUcWaitLoops == sLastUcWaitLoops &&
         gItlwmEnableCalls == sLastEnableCalls &&
         gItlwmInitTaskCalls == sLastInitTaskCalls &&
         gItlwmIwxStopCalls == sLastIwxStopCalls &&
@@ -596,6 +600,7 @@ void AirportItlwm::publishRuntimeCounters()
     sLastRadioMark = (uint32_t)gItlwmRadioMark;
     sLastHwMark = gItlwmHwMark;
     sLastCmdKicks = gItlwmCmdKicks;
+    sLastUcWaitLoops = gItlwmUcWaitLoops;
     sLastEnableCalls = gItlwmEnableCalls;
     sLastInitTaskCalls = gItlwmInitTaskCalls;
     sLastIwxStopCalls = gItlwmIwxStopCalls;
@@ -881,6 +886,14 @@ void AirportItlwm::publishRuntimeCounters()
     setProperty("ItlwmCmdKicks", (UInt64)gItlwmCmdKicks, 32);
     setProperty("ItlwmCmdKicksAtHw", (UInt64)gItlwmCmdKicksAtHw, 32);
     setProperty("ItlwmCmdLastCode", (UInt64)gItlwmCmdLastCode, 32);
+    // The ALIVE wait's exit condition. ItlwmUcWaitLoops = 0 means uc_intr was ALREADY set when
+    // the wait was reached — the race the restored loop exists to survive, and on the old code
+    // that boot slept a full second and returned EWOULDBLOCK anyway. 1..9 = it slept and was
+    // woken normally. 10 = the firmware genuinely never came alive, and UcOkAtWait will be 0.
+    // UcOkAtWait = 1 alongside a non-zero ItlwmRadioErr0 is a PROVEN lost wakeup.
+    setProperty("ItlwmUcIntrAtWait", (UInt64)gItlwmUcIntrAtWait, 32);
+    setProperty("ItlwmUcOkAtWait", (UInt64)gItlwmUcOkAtWait, 32);
+    setProperty("ItlwmUcWaitLoops", (UInt64)gItlwmUcWaitLoops, 32);
     // SetPowerOn - EnableAdapterCalls MUST equal SetPowerGated. A disagreement means the wiring
     // is wrong, not the driver — discard the boot rather than reading anything into it.
     setProperty("ItlwmSetPowerOn", (UInt64)gItlwmSetPowerOn, 32);

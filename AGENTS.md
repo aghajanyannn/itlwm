@@ -570,7 +570,15 @@ including `itlwm.kext`, 952 undefined against the archived 25G83 with 0 missing 
 adds no external symbols), `mapdrv` 211 + 45 correct / 0 wrong, `callcheck` 94 slots / 0 wrong, and
 every new increment proved to survive preprocessing.
 
-**BOOT 1 IS DONE and the instrument caught a pristine stall on its first try:
+**BOOT 2 FOUND THE ROOT CAUSE: the ALIVE wait's retry loop in `iwx_load_firmware` is commented
+out upstream and replaced by a single unconditional `tsleep_nsec`, so a firmware ALIVE interrupt
+that lands before the sleeper enqueues is lost and the wait returns EWOULDBLOCK on a device that
+is alive.** That is mechanism 8's defect on a different wait, and it is the one that fires.
+`ItlwmHwMark = 3`, `UcodeMark = 2`, `AliveMark = 2`, and **zero host commands sent on the attempt**
+name it exactly. Upstream's loop is restored, with three counters on its own exit condition.
+UNBOOTED. Full reading in mechanism 26.
+
+**BOOT 1 caught a pristine stall on its first try:
 `ItlwmRadioMark0 = 8`, `ItlwmRadioErr0 = 35` (EWOULDBLOCK) — `iwx_init_hw()` failed on an expired
 wait — with `ItlwmIfFlags = 0x8807`, the predicted stalled value to the bit, which confirms the
 sticky-`IFF_UP` mechanism by measurement.** Round 2 (the per-attempt split that names which wait)
@@ -578,13 +586,11 @@ is landed and unbooted. Full reading in mechanism 26.
 
 **Next steps, in order:**
 
-1. **Boot round 2 and read `ItlwmHwMark`**, then `UcodeMark` / `AliveMark` /
-   `CmdKicks - CmdKicksAtHw`. Those four name the exact wait that expired inside `iwx_init_hw`.
-2. **Then the stickiness repair, as its own change and its own boot.** It is justified by boot 1
-   on its own evidence and is worth having whichever wait is at fault, but it is upstream HAL code
-   on the path the machine's Wi-Fi depends on. **Do not repair and instrument in the same cycle.**
-3. **Then the root cause** of the expired wait.
-4. **Then the remaining functional gaps**: 20 (LQM rate group — cheapest, the driver already has
+1. **Boot the repair.** Success is Wi-Fi working from cold with no toggle: `ItlwmRadioMark0 = 14`
+   and `ItlwmIcStateLive != 0`. `ItlwmUcWaitLoops = 0` is the race caught and survived.
+2. **Then mechanism 8 proper** — the identical dropped loop on `iwx_run_init_mvm_ucode`'s
+   INIT_COMPLETE wait, latent rather than observed, but the same defect.
+3. **Then the remaining functional gaps**: 20 (LQM rate group — cheapest, the driver already has
    the number), 17 (`networksetup` association report), 18 (roaming), 22 (Private Wi-Fi Address =
    Off). Mechanism 14 (scan request parameters) is unblocked now that completion corresponds to a
    real sweep.
@@ -1973,6 +1979,13 @@ every `ITLWM_*_OFFSET`, and every `Itlwm*` counter.
    loop is unchanged context in `git diff 53c51c2 HEAD`, and `hal_iwm/fw.cpp` carries the identical
    shape with its own unused `wait_flags`, so it is a port-wide idiom rather than a local slip.
    That makes it in scope for repair and out of scope for deletion.
+   **THE SAME DROPPED LOOP EXISTS ON THE ALIVE WAIT IN `iwx_load_firmware`, AND THAT ONE IS
+   MEASURED FIRING** — it is mechanism 26's root cause, and it is repaired there by restoring
+   upstream's loop verbatim. That settles this entry's open question in principle: the loop CAN be
+   restored, the locking discipline does not prevent it (same channel, same `tsleep_nsec`, same
+   total budget), and the retest is safe because the ISR sets the predicate before it wakes. Apply
+   the same treatment here once mechanism 26's repair is booted and confirmed.
+
    `ItlwmPreSleepInitComplete` is now published on surviving boots too (mechanism 9), so the
    lost-wakeup-versus-never-arrived question is finally answerable without an attach failure.
    **First such boot (25G83): `ItlwmInitMark = 7`, `ItlwmInitErr = 0`, `PreSleepInitComplete = 0`.**
@@ -3136,16 +3149,91 @@ every `ITLWM_*_OFFSET`, and every `Itlwm*` counter.
 
     The errno needs no new counter: `iwx_init_hw`'s return is already `ItlwmRadioErr0`.
 
+    ### BOOT 2 (2026-08-23 07:58, build `CAA7233D`) — ROOT CAUSE NAMED
+
+    Pristine again — no toggle since boot, `DisableCalls = SetPowerOff = PmOffCalls = 0`.
+
+    ```text
+    ItlwmRadioMark0 = 8   ItlwmRadioErr0 = 35        <- iwx_init_hw, EWOULDBLOCK (as boot 1)
+    ItlwmHwMark     = 3   <- last step ENTERED in iwx_init_hw = iwx_run_init_mvm_ucode
+    ItlwmUcodeMark  = 2   ItlwmUcodeErr = 35         <- per-attempt: load_ucode_wait_alive failed
+    ItlwmAliveMark  = 2   <- inside it: iwx_start_fw, i.e. THE ALIVE WAIT
+    ItlwmCmdKicks = 3  ItlwmCmdKicksAtHw = 3         <- ZERO commands sent on this attempt
+    ItlwmInitAttempts = 2  InitTaskCalls = 2  GenLive = 2  EnableCalls = 1
+    ItlwmInitMark = 7                                <- the CUMULATIVE one, still the ATTACH value
+    ```
+
+    **The firmware ALIVE notification never reached the sleeper.** `CmdKicks - CmdKicksAtHw = 0`
+    proves the expired wait was not a command response, exactly as the round-2 design predicted
+    would point at the ALIVE/PNVM waits.
+
+    **`ItlwmInitMark = 7` beside `ItlwmUcodeMark = 2` is the ambiguity demonstrated.** The
+    cumulative counter says "`iwx_run_init_mvm_ucode` succeeded" — the attach value — while the
+    per-attempt one says it failed at mark 2 on this attempt. Trusting the cumulative one produced
+    a wrong localisation before round 2 was built. It earned its keep on its first boot.
+
+    **`InitAttempts = 2` with `EnableCalls = 1`**: the enable path ran twice from one
+    `ItlIwx::enable`, via one of the ten re-dispatch sites, and both attempts failed identically.
+
+    ### ROOT CAUSE: the ALIVE wait's retry loop is commented out — mechanism 8's defect
+
+    `iwx_load_firmware` carries upstream's loop **commented out, along with its own loop
+    variable**, replaced by a single unconditional sleep:
+
+    ```c
+    int err/*, w*/;
+    sc->sc_uc.uc_intr = 0;
+    ... iwx_ctxt_info_init(sc, fws);          /* this kicks the firmware load */
+//  for (w = 0; !sc->sc_uc.uc_intr && w < 10; w++)
+//      err = tsleep_nsec(&sc->sc_uc, 0, "iwxuc", MSEC_TO_NSEC(100));
+    err = tsleep_nsec(&sc->sc_uc, 0, "iwxuc", SEC_TO_NSEC(1));
+    ```
+
+    The ISR does `sc->sc_uc.uc_intr = 1;` and only **then** `wakeupOn(&sc->sc_uc)`. So if the ALIVE
+    interrupt lands in the window between `iwx_ctxt_info_init` kicking the load and the `tsleep`
+    enqueueing, the wakeup is consumed by nobody, the sleep runs its full second, and the function
+    returns EWOULDBLOCK **on a device that is alive and well**. That window is timing-dependent,
+    which is precisely why the stall is intermittent.
+
+    **This is mechanism 8's defect on a different wait**, and it is the one that actually fires.
+    Both are upstream (present verbatim at `53c51c2`), so both are repair-scope.
+
+    ### LANDED, UNBOOTED — the repair, plus its own witness
+
+    The loop is restored exactly as upstream wrote it. Same channel, same `tsleep_nsec`, same 1 s
+    total budget as ten 100 ms slices, so it **cannot behave worse** than the single sleep it
+    replaces; what it adds is the retest, which is what survives the race.
+
+    Three counters say why the wait ended, sampled the instant it does:
+
+    | property | says |
+    | --- | --- |
+    | `ItlwmUcWaitLoops` | **0 = `uc_intr` was already set on entry — the race, caught.** 1..9 = slept and was woken normally. 10 = the firmware genuinely never came alive |
+    | `ItlwmUcOkAtWait` | 1 alongside a non-zero `ItlwmRadioErr0` is a **proven lost wakeup** |
+    | `ItlwmUcIntrAtWait` | the predicate the loop tests |
+
+    **This mixes a repair with an instrument, deliberately, and the rule is not being ignored.**
+    The witness measures the repaired loop's *own* exit condition — it is diagnostic of the repair,
+    not an independent quantity the repair could contaminate — so the failure mode the rule guards
+    against ("was it the instrument or the fix?") cannot arise here.
+
+    **The stickiness repair is NOT the fix and is demoted.** Boot 2 shows the driver already
+    retried twice and failed identically, so merely clearing `IFF_UP` would have bought nothing.
+    The reason a manual toggle recovers is narrower than "it retries": `ItlIwx::disable` ->
+    `ItlIwx::enable` re-runs `iwx_activate(DVACT_RESUME)` -> `iwx_resume` -> `iwx_prepare_card_hw`,
+    which the bare `init_task` re-dispatch never does. If the stickiness is ever repaired it must
+    re-run the resume leg, not just clear the flag.
+
     ### Next steps, in order
 
-    1. **Boot round 2 and read `ItlwmHwMark` first**, then `UcodeMark`, `AliveMark`, and
-       `CmdKicks - CmdKicksAtHw`. Together they name the exact wait that expired.
-    2. **Then the stickiness repair, as its own change and its own boot** — clearing `IFF_UP` when
-       the enable did not reach mark 14, so a failed enable is retried instead of latched. It is
-       justified by boot 1 on its own evidence and is worth having whichever wait turns out to be
-       at fault, but it is upstream HAL code on the path the machine's Wi-Fi depends on.
-       **Do not repair and instrument in the same boot cycle.**
-    3. **Then the root cause** of the expired wait.
+    1. **Boot the repair.** Success is Wi-Fi working from cold with no toggle, with `Mark0 = 14`
+       and `ItlwmIcStateLive != 0`. `ItlwmUcWaitLoops = 0` on such a boot is the race caught and
+       survived — the direct proof the loop was the fix.
+    2. **If it still stalls**, read `ItlwmUcOkAtWait`: 1 means the firmware was alive and the
+       wakeup was lost somewhere the retest cannot see; 0 with `Loops = 10` means the firmware
+       genuinely never came alive and the fault is below this layer.
+    3. **Then mechanism 8 proper** — the identical dropped loop on `iwx_run_init_mvm_ucode`'s
+       INIT_COMPLETE wait, which has not been observed firing but is the same latent defect.
 
     **Done when** ten consecutive boots reach `ItlwmIcStateLive != 0` with no power toggle.
 

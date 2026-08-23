@@ -293,6 +293,14 @@ uint32_t gItlwmAliveMark;
 uint32_t gItlwmCmdKicks;
 uint32_t gItlwmCmdKicksAtHw;
 uint32_t gItlwmCmdLastCode;
+// The ALIVE wait's own exit condition, sampled the instant the wait ends. uc_intr is the
+// predicate the restored loop tests; uc_ok says whether the firmware actually came alive.
+// UcOkAtWait = 1 with a non-zero ItlwmRadioErr0 is a PROVEN lost wakeup: the firmware was up
+// and the sleeper was told nothing. Loops = iterations actually slept, so 0 means uc_intr was
+// already set on entry — the exact race the single unconditional tsleep could not survive.
+uint32_t gItlwmUcIntrAtWait;
+uint32_t gItlwmUcOkAtWait;
+uint32_t gItlwmUcWaitLoops;
 }
 #define ITLWM_PREINIT_MARK(n, e) \
     do { gItlwmPreinitMark = (n); gItlwmPreinitErr = (e); } while (0)
@@ -303,6 +311,11 @@ uint32_t gItlwmCmdLastCode;
 // own: the value iwx_init_hw returns is already latched as ItlwmRadioErr0 by the mark-8 site.
 // Placed BEFORE each call and never in front of a return, so no unbraced `if` can capture one.
 #define ITLWM_HW_MARK(n)    do { gItlwmHwMark = (n); } while (0)
+#define ITLWM_UC_WAIT(sc, w) do { \
+    gItlwmUcIntrAtWait = (sc)->sc_uc.uc_intr ? 1 : 0; \
+    gItlwmUcOkAtWait   = (sc)->sc_uc.uc_ok ? 1 : 0; \
+    gItlwmUcWaitLoops  = (uint32_t)(w); \
+} while (0)
 #define ITLWM_ALIVE_MARK(n) do { gItlwmAliveMark = (n); } while (0)
 #define ITLWM_HW_RESET()    do { \
     gItlwmHwMark = 0; gItlwmUcodeMark = 0; gItlwmUcodeErr = 0; gItlwmAliveMark = 0; \
@@ -389,6 +402,7 @@ uint32_t gItlwmCmdLastCode;
 #define ITLWM_PREINIT_MARK(n, e) do { } while (0)
 #define ITLWM_INIT_MARK(n, e) do { } while (0)
 #define ITLWM_HW_MARK(n) do { } while (0)
+#define ITLWM_UC_WAIT(sc, w) do { } while (0)
 #define ITLWM_ALIVE_MARK(n) do { } while (0)
 #define ITLWM_HW_RESET() do { } while (0)
 #define ITLWM_PRESLEEP_SNAP(sc) do { } while (0)
@@ -4992,7 +5006,7 @@ iwx_load_firmware(struct iwx_softc *sc)
 {
     XYLog("%s\n", __FUNCTION__);
     struct iwx_fw_sects *fws;
-    int err/*, w*/;
+    int err, w;
 
     sc->sc_uc.uc_intr = 0;
     
@@ -5007,10 +5021,27 @@ iwx_load_firmware(struct iwx_softc *sc)
     }
     
     /* wait for the firmware to load */
-//    for (w = 0; !sc->sc_uc.uc_intr && w < 10; w++) {
-//        err = tsleep_nsec(&sc->sc_uc, 0, "iwxuc", MSEC_TO_NSEC(100));
-//    }
-    err = tsleep_nsec(&sc->sc_uc, 0, "iwxuc", SEC_TO_NSEC(1));
+    // MECHANISM 26 ROOT CAUSE, and this loop is upstream's — it was commented out here (along
+    // with its own loop variable) and replaced by a single unconditional tsleep_nsec. That
+    // cannot observe a notification that arrived BEFORE the sleeper enqueued: iwx_ctxt_info_init
+    // above kicks the firmware load, and the ALIVE interrupt can land in the window between that
+    // and the tsleep. The sleep then runs its full second and returns EWOULDBLOCK on a device
+    // that is alive and well. Which is exactly what two boots measured: RadioMark0 = 8,
+    // RadioErr0 = 35, HwMark = 3, UcodeMark = 2, AliveMark = 2, and ZERO host commands sent on
+    // the attempt — so the expired wait was never a command response.
+    //
+    // The retest is what makes it safe: the ISR sets sc_uc.uc_intr = 1 and only THEN calls
+    // wakeupOn(&sc->sc_uc), so a wakeup that beat us here leaves the predicate already true and
+    // the loop exits without sleeping at all, with err still 0 from iwx_ctxt_info_init.
+    //
+    // The locking discipline is unchanged — same channel, same tsleep_nsec, same total 1 s
+    // budget as ten 100 ms slices — so this cannot behave worse than the single sleep it
+    // replaces. Root AGENTS.md mechanism 8 records the identical dropped-loop idiom on
+    // iwx_run_init_mvm_ucode's INIT_COMPLETE wait; this is the same defect on the ALIVE wait,
+    // and it is the one that fires.
+    for (w = 0; !sc->sc_uc.uc_intr && w < 10; w++)
+        err = tsleep_nsec(&sc->sc_uc, 0, "iwxuc", MSEC_TO_NSEC(100));
+    ITLWM_UC_WAIT(sc, w);
     if (err || !sc->sc_uc.uc_ok) {
         if (iwx_nic_lock(sc)) {
             XYLog("SecBoot CPU1 Status: 0x%x, CPU2 Status: 0x%x\n",

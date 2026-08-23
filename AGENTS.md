@@ -570,6 +570,13 @@ including `itlwm.kext`, 952 undefined against the archived 25G83 with 0 missing 
 adds no external symbols), `mapdrv` 211 + 45 correct / 0 wrong, `callcheck` 94 slots / 0 wrong, and
 every new increment proved to survive preprocessing.
 
+**BOOT 3: `ItlwmRadioMark0 = 14`, `IfFlags = 0x8847`, `IcStateLive = 4`, `Country Code: DE`,
+connected — a cold boot with no toggle, and the whole predicted healthy row matched, so the
+instrument is validated and every stalled reading above is now trustworthy.** But
+`ItlwmUcWaitLoops = 2` means the race did NOT fire on that boot, so it is **not** proof the repair
+works; the old code would have come up fine too. The direct proof is a `Loops = 0` boot that
+works. Tally so far: 1 / 10.
+
 **BOOT 2 FOUND THE ROOT CAUSE: the ALIVE wait's retry loop in `iwx_load_firmware` is commented
 out upstream and replaced by a single unconditional `tsleep_nsec`, so a firmware ALIVE interrupt
 that lands before the sleeper enqueues is lost and the wait returns EWOULDBLOCK on a device that
@@ -3224,18 +3231,55 @@ every `ITLWM_*_OFFSET`, and every `Itlwm*` counter.
     which the bare `init_task` re-dispatch never does. If the stickiness is ever repaired it must
     re-run the resume leg, not just clear the flag.
 
+    ### BOOT 3 (2026-08-23 08:19, build `54723A7B`) — THE SELF-TEST PASSES, AND Wi-Fi WORKS
+
+    Cold boot, nothing toggled: `SetPowerOff = 0`, `DisableCalls = 0`, `EnableCalls = 1`.
+
+    ```text
+    ItlwmRadioMark0 = 14   ItlwmRadioErr0 = 0        <- SUCCESS, the value never seen before
+    ItlwmHwMark = 18       iwx_init_hw reached the end
+    ItlwmUcodeMark = 7     UcodeErr = 0    AliveMark = 3   (past the ALIVE wait, into load_pnvm)
+    ItlwmIfFlags = 0x8847  ItlwmIcStateLive = 4 (RUN)      ItlwmWaitExitState = 1 (SCAN)
+    ItlwmRadioSleeps = 1   ScanStateWakes = 10   EnableRefused = 0
+    ItlwmInitAttempts = 1  InitTaskCalls = 1  GenLive = 1  IwxStopCalls = 0
+    ItlwmSetPowerOn = 1  EnableAdapterCalls = 1  SetPowerGated = 0     <- identity holds
+    ItlwmCmdKicks = 93  CmdKicksAtHw = 3          <- 90 commands sent on the attempt (was 0)
+    ScanBeacons = 962  ScanReqStarted = 19  ScanReqRefused = 1         (was 0 / 0 / 200)
+    en3 status: active     Country Code: DE       Status: Connected
+    ```
+
+    **Every value in the healthy row this entry predicted is matched exactly** — `Mark0 = 14`,
+    `IfFlags = 0x8847`, `WaitExitState = 1`, `RadioSleeps = 1`, `InitTaskCalls = 1`. So the
+    instrument is validated end to end, and **every stalled reading recorded above is now
+    trustworthy** rather than merely internally consistent.
+
+    **BUT THIS BOOT DOES NOT PROVE THE REPAIR FIXED THE STALL, and it must not be recorded as if
+    it did.** `ItlwmUcWaitLoops = 2` — the loop slept and was woken normally on its second 100 ms
+    slice. The race did **not** fire here: `Loops = 0` is the signature of a wakeup that beat the
+    sleeper, and that is the case the restored loop exists to survive. A single 1 s `tsleep` would
+    have been woken at the same ~200 ms and this boot would have come up fine on the old code too.
+
+    What this boot does establish: the loop behaves correctly, it does not break a healthy boot,
+    and the self-test is met. What it does not establish: that the stall is gone.
+
+    **The direct proof is a boot with `ItlwmUcWaitLoops = 0` and Wi-Fi working.** That is the race
+    caught and survived, and nothing else demonstrates it in one boot. Failing that, the
+    statistical case is the "Done when" below — and note the prior base rate is 3 stalls in 3
+    recent cold boots on the old code against 1 clean boot on the new, which is suggestive and
+    nowhere near sufficient.
+
     ### Next steps, in order
 
-    1. **Boot the repair.** Success is Wi-Fi working from cold with no toggle, with `Mark0 = 14`
-       and `ItlwmIcStateLive != 0`. `ItlwmUcWaitLoops = 0` on such a boot is the race caught and
-       survived — the direct proof the loop was the fix.
-    2. **If it still stalls**, read `ItlwmUcOkAtWait`: 1 means the firmware was alive and the
-       wakeup was lost somewhere the retest cannot see; 0 with `Loops = 10` means the firmware
-       genuinely never came alive and the fault is below this layer.
+    1. **Keep booting and record `ItlwmUcWaitLoops` each time.** A `Loops = 0` boot that works is
+       the direct proof. Ten consecutive clean cold boots is the fallback.
+    2. **If a stall recurs**, read `ItlwmUcOkAtWait`: 1 means the firmware was alive and the wakeup
+       was lost somewhere the retest cannot see; 0 with `Loops = 10` means it genuinely never came
+       alive and the fault is below this layer.
     3. **Then mechanism 8 proper** — the identical dropped loop on `iwx_run_init_mvm_ucode`'s
-       INIT_COMPLETE wait, which has not been observed firing but is the same latent defect.
+       INIT_COMPLETE wait, latent rather than observed, but the same defect.
 
     **Done when** ten consecutive boots reach `ItlwmIcStateLive != 0` with no power toggle.
+    Boots so far: **1 / 10.**
 
 ## DOX framework
 

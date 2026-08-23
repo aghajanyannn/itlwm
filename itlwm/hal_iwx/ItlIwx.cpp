@@ -249,14 +249,108 @@ uint32_t gItlwmIctResetAtKick;
 //                              routed to DRAM and IWX_CSR_INT would stay 0.
 uint32_t gItlwmIctPaddrLo;
 uint32_t gItlwmIctTblReg;
+// Mechanism 26 — the enable path. ItlIwx::enable manufactures kIOReturnSuccess on both of
+// its paths, iwx_activate returns a hardcoded 0 having computed an error, and enableAdapter
+// and setPOWER each discard what they are handed. Five consecutive callers throw the outcome
+// away, so "IOC_POWER Set returns GOOD" is manufactured by the driver and is evidence of
+// nothing. Worse, the outcome that matters is ASYNCHRONOUS — iwx_init runs on the systq
+// thread long after ItlIwx::enable returned — so an honest return chain could not report it
+// even if every hop were fixed. It has to be latched where it becomes known.
+//
+// gItlwmRadioMark is that latch: one integer naming which of the fourteen exits the enable
+// path took. gItlwmRadioMark0 is the FIRST terminal exit and is write-once, so an operator's
+// recovery toggle cannot overwrite the reading that matters.
+int gItlwmRadioMark;
+int gItlwmRadioErr;
+int gItlwmRadioMark0;
+int gItlwmRadioErr0;
+uint32_t gItlwmRadioMark0Set;
+uint32_t gItlwmEnableCalls;
+uint32_t gItlwmEnableRefused;
+int gItlwmResumeErr;
+uint32_t gItlwmInitTaskCalls;
+uint32_t gItlwmInitTaskFatal;
+uint32_t gItlwmInitTaskFlags;
+uint32_t gItlwmInitAttempts;
+uint32_t gItlwmWaitExitState;
+uint32_t gItlwmScanStateWakes;
+uint32_t gItlwmRadioSleeps;
+uint32_t gItlwmIwxStopCalls;
+// Mechanism 26, second round. RadioMark0 = 8 named iwx_init_hw and stopped there; these split
+// it. All are PER-ATTEMPT — reset at iwx_init_hw entry — which is the whole point:
+// ItlwmPreinitMark and ItlwmInitMark are cumulative and are rewritten by BOTH the attach-time
+// and the enable-time call, so a value that also occurs at attach cannot be attributed to
+// either. Reading them as enable-path values produced two wrong localisations in one sitting.
+// A per-attempt counter reading 0 means "this did not run on this attempt", full stop.
+uint32_t gItlwmHwMark;
+uint32_t gItlwmUcodeMark;
+int gItlwmUcodeErr;
+uint32_t gItlwmAliveMark;
+// Kicks is cumulative; KicksAtHw is latched at iwx_init_hw entry. The difference is how many
+// host commands actually went out on this attempt, which is what separates a wait that expired
+// on a command from one that expired on a bare firmware notification. LastCode is the wide id
+// of the last command kicked: (group << 8) | opcode.
+uint32_t gItlwmCmdKicks;
+uint32_t gItlwmCmdKicksAtHw;
+uint32_t gItlwmCmdLastCode;
+// The ALIVE wait's own exit condition, sampled the instant the wait ends. uc_intr is the
+// predicate the restored loop tests; uc_ok says whether the firmware actually came alive.
+// UcOkAtWait = 1 with a non-zero ItlwmRadioErr0 is a PROVEN lost wakeup: the firmware was up
+// and the sleeper was told nothing. Loops = iterations actually slept, so 0 means uc_intr was
+// already set on entry — the exact race the single unconditional tsleep could not survive.
+uint32_t gItlwmUcIntrAtWait;
+uint32_t gItlwmUcOkAtWait;
+uint32_t gItlwmUcWaitLoops;
 }
 #define ITLWM_PREINIT_MARK(n, e) \
     do { gItlwmPreinitMark = (n); gItlwmPreinitErr = (e); } while (0)
 #define ITLWM_INIT_MARK(n, e) \
-    do { gItlwmInitMark = (n); gItlwmInitErr = (e); } while (0)
+    do { gItlwmInitMark = (n); gItlwmInitErr = (e); \
+         gItlwmUcodeMark = (n); gItlwmUcodeErr = (e); } while (0)
+// Step ordinals inside iwx_init_hw and iwx_load_ucode_wait_alive. They carry no errno of their
+// own: the value iwx_init_hw returns is already latched as ItlwmRadioErr0 by the mark-8 site.
+// Placed BEFORE each call and never in front of a return, so no unbraced `if` can capture one.
+#define ITLWM_HW_MARK(n)    do { gItlwmHwMark = (n); } while (0)
+#define ITLWM_UC_WAIT(sc, w) do { \
+    gItlwmUcIntrAtWait = (sc)->sc_uc.uc_intr ? 1 : 0; \
+    gItlwmUcOkAtWait   = (sc)->sc_uc.uc_ok ? 1 : 0; \
+    gItlwmUcWaitLoops  = (uint32_t)(w); \
+} while (0)
+#define ITLWM_ALIVE_MARK(n) do { gItlwmAliveMark = (n); } while (0)
+#define ITLWM_HW_RESET()    do { \
+    gItlwmHwMark = 0; gItlwmUcodeMark = 0; gItlwmUcodeErr = 0; gItlwmAliveMark = 0; \
+    gItlwmCmdKicksAtHw = gItlwmCmdKicks; \
+} while (0)
 #define ITLWM_PRESLEEP_SNAP(sc) \
     do { gItlwmPreSleepInitComplete = (uint32_t)(sc)->sc_init_complete; } while (0)
-#define ITLWM_CMD_KICK(ring) do { \
+// A mark is TERMINAL when no further mark can follow it within the same enable attempt.
+// Mark0 latches on the first of these — including 14, success — so on a healthy boot Mark0
+// reads 14 and a dead instrument is distinguishable from a healthy one. Latching on the
+// first terminal rather than on an attempt counter matters because ten sites in this file
+// re-dispatch init_task without any second ItlIwx::enable, so an attempt counter does not
+// bound an attempt.
+#define ITLWM_RADIO_TERMINAL(n) \
+    ((n) == 2 || (n) == 3 || (n) == 5 || (n) == 6 || (n) == 8 || \
+     (n) == 10 || (n) == 12 || (n) == 13 || (n) == 14)
+#define ITLWM_RADIO_MARK(n, e) do { \
+    gItlwmRadioMark = (n); \
+    gItlwmRadioErr = (int)(e); \
+    if (!gItlwmRadioMark0Set && ITLWM_RADIO_TERMINAL(n)) { \
+        gItlwmRadioMark0 = (n); \
+        gItlwmRadioErr0 = (int)(e); \
+        gItlwmRadioMark0Set = 1; \
+    } \
+} while (0)
+// No gItlwm* identifier may appear in this file outside a macro. ItlIwx.cpp is compiled into
+// all ten targets, and __IO80211_TARGET is undefined for itlwm.kext and below __MAC_26_0 for
+// the eight pre-Tahoe AirportItlwm targets, so a bare store is a compile break on nine of
+// them. Reaching for the obvious cure — moving the declaration outside the fence its
+// definition is inside — is mechanism 25's exact shape. Route it through ITLWM_CNT/ITLWM_SET.
+#define ITLWM_CNT(v)     do { (v)++; } while (0)
+#define ITLWM_SET(v, x)  do { (v) = (x); } while (0)
+#define ITLWM_CMD_KICK(ring, code) do { \
+    gItlwmCmdKicks++; \
+    gItlwmCmdLastCode = (uint32_t)(code); \
     gItlwmCmdQid = (uint32_t)(ring)->qid; \
     gItlwmCmdDoorbell = (uint32_t)((ring)->qid << 16 | (ring)->cur); \
     gItlwmIsrAtKick = gItlwmIsrCount; \
@@ -307,9 +401,16 @@ uint32_t gItlwmIctTblReg;
 #else
 #define ITLWM_PREINIT_MARK(n, e) do { } while (0)
 #define ITLWM_INIT_MARK(n, e) do { } while (0)
+#define ITLWM_HW_MARK(n) do { } while (0)
+#define ITLWM_UC_WAIT(sc, w) do { } while (0)
+#define ITLWM_ALIVE_MARK(n) do { } while (0)
+#define ITLWM_HW_RESET() do { } while (0)
 #define ITLWM_PRESLEEP_SNAP(sc) do { } while (0)
+#define ITLWM_RADIO_MARK(n, e) do { } while (0)
+#define ITLWM_CNT(v) do { } while (0)
+#define ITLWM_SET(v, x) do { } while (0)
 #define ITLWM_PREINIT_SNAP(sc) do { } while (0)
-#define ITLWM_CMD_KICK(ring) do { } while (0)
+#define ITLWM_CMD_KICK(ring, code) do { } while (0)
 #define ITLWM_CMD_DONE(qid, code) do { } while (0)
 #define ITLWM_NOTIF_INTR() do { } while (0)
 #define ITLWM_ISR() do { } while (0)
@@ -408,11 +509,23 @@ IOReturn ItlIwx::enable(IONetworkInterface *netif)
 {
     XYLog("%s\n", __PRETTY_FUNCTION__);
     struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
+    // Counted before the refusal test, so refused calls are counted too. It is also the
+    // denominator of the self-test: publishRuntimeCounters runs only from watchdogAction and
+    // the watchdog's only arm is inside enableAdapter, so any boot that publishes a runtime
+    // counter at all must show this >= 1.
+    ITLWM_CNT(gItlwmEnableCalls);
     if (ifp->if_flags & IFF_UP) {
         XYLog("%s already in activating state\n", __FUNCTION__);
+        ITLWM_CNT(gItlwmEnableRefused);
+        ITLWM_RADIO_MARK(2, 0);
         return kIOReturnSuccess;
     }
+    // IFF_UP is set BEFORE anything is attempted and the only code in the whole build that
+    // clears it is ItlIwx::disable below. So every failure exit past this line latches both
+    // recovery gates — this one, and setPOWER's isRunning test — and the stall is sticky
+    // until something disables the adapter. That is the shape mechanism 26 is chasing.
     ifp->if_flags |= IFF_UP;
+    ITLWM_RADIO_MARK(1, 0);
     iwx_activate(&com, DVACT_RESUME);
     iwx_activate(&com, DVACT_WAKEUP);
     return kIOReturnSuccess;
@@ -4893,7 +5006,7 @@ iwx_load_firmware(struct iwx_softc *sc)
 {
     XYLog("%s\n", __FUNCTION__);
     struct iwx_fw_sects *fws;
-    int err/*, w*/;
+    int err, w;
 
     sc->sc_uc.uc_intr = 0;
     
@@ -4908,10 +5021,27 @@ iwx_load_firmware(struct iwx_softc *sc)
     }
     
     /* wait for the firmware to load */
-//    for (w = 0; !sc->sc_uc.uc_intr && w < 10; w++) {
-//        err = tsleep_nsec(&sc->sc_uc, 0, "iwxuc", MSEC_TO_NSEC(100));
-//    }
-    err = tsleep_nsec(&sc->sc_uc, 0, "iwxuc", SEC_TO_NSEC(1));
+    // MECHANISM 26 ROOT CAUSE, and this loop is upstream's — it was commented out here (along
+    // with its own loop variable) and replaced by a single unconditional tsleep_nsec. That
+    // cannot observe a notification that arrived BEFORE the sleeper enqueued: iwx_ctxt_info_init
+    // above kicks the firmware load, and the ALIVE interrupt can land in the window between that
+    // and the tsleep. The sleep then runs its full second and returns EWOULDBLOCK on a device
+    // that is alive and well. Which is exactly what two boots measured: RadioMark0 = 8,
+    // RadioErr0 = 35, HwMark = 3, UcodeMark = 2, AliveMark = 2, and ZERO host commands sent on
+    // the attempt — so the expired wait was never a command response.
+    //
+    // The retest is what makes it safe: the ISR sets sc_uc.uc_intr = 1 and only THEN calls
+    // wakeupOn(&sc->sc_uc), so a wakeup that beat us here leaves the predicate already true and
+    // the loop exits without sleeping at all, with err still 0 from iwx_ctxt_info_init.
+    //
+    // The locking discipline is unchanged — same channel, same tsleep_nsec, same total 1 s
+    // budget as ten 100 ms slices — so this cannot behave worse than the single sleep it
+    // replaces. Root AGENTS.md mechanism 8 records the identical dropped-loop idiom on
+    // iwx_run_init_mvm_ucode's INIT_COMPLETE wait; this is the same defect on the ALIVE wait,
+    // and it is the one that fires.
+    for (w = 0; !sc->sc_uc.uc_intr && w < 10; w++)
+        err = tsleep_nsec(&sc->sc_uc, 0, "iwxuc", MSEC_TO_NSEC(100));
+    ITLWM_UC_WAIT(sc, w);
     if (err || !sc->sc_uc.uc_ok) {
         if (iwx_nic_lock(sc)) {
             XYLog("SecBoot CPU1 Status: 0x%x, CPU2 Status: 0x%x\n",
@@ -5028,14 +5158,17 @@ iwx_load_ucode_wait_alive(struct iwx_softc *sc)
     XYLog("%s\n", __FUNCTION__);
     int err;
     
+    ITLWM_ALIVE_MARK(1);
     err = iwx_read_firmware(sc);
     if (err)
         return err;
     
+    ITLWM_ALIVE_MARK(2);
     err = iwx_start_fw(sc);
     if (err)
         return err;
     
+    ITLWM_ALIVE_MARK(3);
     err = iwx_load_pnvm(sc);
     if (err)
         return err;
@@ -6654,7 +6787,7 @@ iwx_send_cmd(struct iwx_softc *sc, struct iwx_host_cmd *hcmd)
     DPRINTF(("%s: Sending command (%.2x.%.2x), %d bytes at [%d]:%d ver: %d\n", __func__, group_id, cmd->hdr.cmd, cmd->hdr_wide.length, cmd->hdr.idx, cmd->hdr.qid, cmd->hdr_wide.version));
     ring->queued++;
     ring->cur = (ring->cur + 1) % getTxQueueSize();
-    ITLWM_CMD_KICK(ring);
+    ITLWM_CMD_KICK(ring, code);
     IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR, ring->qid << 16 | ring->cur);
 
     if (!async) {
@@ -8832,6 +8965,9 @@ iwx_scan(struct iwx_softc *sc)
         ieee80211_node_cleanup(ic, ic->ic_bss);
     }
     ic->ic_state = IEEE80211_S_SCAN;
+    // The only wakeupOn(&ic->ic_state) in this file, so the count is exact. 0 alongside
+    // mark 13 means the scan never got this far and the sleeper was never going to be woken.
+    ITLWM_CNT(gItlwmScanStateWakes);
     wakeupOn(&ic->ic_state); /* wake iwx_init() */
     
     return 0;
@@ -10298,23 +10434,31 @@ iwx_init_hw(struct iwx_softc *sc)
     struct ieee80211com *ic = &sc->sc_ic;
     int err, i;
     
+    // Per-attempt reset. Everything below is scoped to THIS call of iwx_init_hw, which is
+    // reached only from iwx_init, i.e. only on the enable path.
+    ITLWM_HW_RESET();
+    ITLWM_HW_MARK(1);
     err = iwx_preinit(sc);
     if (err)
         return err;
     
+    ITLWM_HW_MARK(2);
     err = iwx_start_hw(sc);
     if (err) {
         XYLog("%s: could not initialize hardware\n", DEVNAME(sc));
         return err;
     }
     
+    ITLWM_HW_MARK(3);
     err = iwx_run_init_mvm_ucode(sc, 0);
     if (err)
         return err;
     
+    ITLWM_HW_MARK(4);
     if (!iwx_nic_lock(sc))
         return EBUSY;
     
+    ITLWM_HW_MARK(5);
     err = iwx_send_tx_ant_cfg(sc, iwx_fw_valid_tx_ant(sc));
     if (err) {
         XYLog("%s: could not init tx ant config (error %d)\n",
@@ -10325,6 +10469,7 @@ iwx_init_hw(struct iwx_softc *sc)
     iwx_toggle_tx_ant(sc, &sc->sc_mgmt_last_antenna_idx);
     
     if (sc->sc_tx_with_siso_diversity) {
+        ITLWM_HW_MARK(6);
         err = iwx_send_phy_cfg_cmd(sc);
         if (err) {
             XYLog("%s: could not send phy config (error %d)\n",
@@ -10333,6 +10478,7 @@ iwx_init_hw(struct iwx_softc *sc)
         }
     }
     
+    ITLWM_HW_MARK(7);
     err = iwx_send_bt_init_conf(sc);
     if (err) {
         XYLog("%s: could not init bt coex (error %d)\n",
@@ -10340,17 +10486,20 @@ iwx_init_hw(struct iwx_softc *sc)
         return err;
     }
     
+    ITLWM_HW_MARK(8);
     err = iwx_send_soc_conf(sc);
     if (err)
         return err;
     
     if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_DQA_SUPPORT)){
+        ITLWM_HW_MARK(9);
         err = iwx_send_dqa_cmd(sc);
         if (err)
             return err;
     }
     
     /* Add auxiliary station for scanning */
+    ITLWM_HW_MARK(10);
     err = iwx_add_aux_sta(sc);
     if (err) {
         XYLog("%s: could not add aux station (error %d)\n",
@@ -10366,6 +10515,7 @@ iwx_init_hw(struct iwx_softc *sc)
          */
         sc->sc_phyctxt[i].id = i;
         sc->sc_phyctxt[i].channel = &ic->ic_channels[1];
+        ITLWM_HW_MARK(11);
         err = iwx_phy_ctxt_cmd(sc, &sc->sc_phyctxt[i], 1, 1,
                                IWX_FW_CTXT_ACTION_ADD, 0);
         if (err) {
@@ -10376,6 +10526,7 @@ iwx_init_hw(struct iwx_softc *sc)
     }
     
     if (!isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_SET_LTR_GEN2)) {
+        ITLWM_HW_MARK(12);
         err = iwx_config_ltr(sc);
         if (err) {
             XYLog("%s: PCIe LTR configuration failed (error %d)\n",
@@ -10384,11 +10535,13 @@ iwx_init_hw(struct iwx_softc *sc)
     }
     
     if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_CT_KILL_BY_FW)) {
+        ITLWM_HW_MARK(13);
         err = iwx_send_temp_report_ths_cmd(sc);
         if (err)
             goto err;
     }
     
+    ITLWM_HW_MARK(14);
     err = iwx_power_update_device(sc);
     if (err) {
         XYLog("%s: could not send power command (error %d)\n",
@@ -10397,6 +10550,7 @@ iwx_init_hw(struct iwx_softc *sc)
     }
     
     if (sc->sc_nvm.lar_enabled) {
+        ITLWM_HW_MARK(15);
         err = iwx_send_update_mcc_cmd(sc, "ZZ");
         if (err) {
             XYLog("%s: could not init LAR (error %d)\n",
@@ -10405,6 +10559,7 @@ iwx_init_hw(struct iwx_softc *sc)
         }
     }
     
+    ITLWM_HW_MARK(16);
     err = iwx_config_umac_scan(sc);
     if (err) {
         XYLog("%s: could not configure scan (error %d)\n",
@@ -10412,6 +10567,7 @@ iwx_init_hw(struct iwx_softc *sc)
         goto err;
     }
     
+    ITLWM_HW_MARK(17);
     err = iwx_disable_beacon_filter(sc);
     if (err) {
         XYLog("%s: could not disable beacon filter (error %d)\n",
@@ -10419,6 +10575,7 @@ iwx_init_hw(struct iwx_softc *sc)
         goto err;
     }
     
+    ITLWM_HW_MARK(18);
 err:
     iwx_nic_unlock(sc);
     return err;
@@ -10467,12 +10624,19 @@ iwx_init(struct _ifnet *ifp)
     //    rw_assert_wrlock(&sc->ioctl_rwl);
     
     generation = ++sc->sc_generation;
+    // Attempts is what says whether every cumulative counter below is a SUM. Ten sites in
+    // this file re-dispatch init_task with no second ItlIwx::enable, so > 1 here means the
+    // enable path ran more than once on one boot: read Mark0, not Mark.
+    ITLWM_CNT(gItlwmInitAttempts);
+    ITLWM_SET(gItlwmRadioSleeps, 0);
+    ITLWM_RADIO_MARK(7, 0);
     
     //    KASSERT(sc->task_refs.refs == 0);
     //    refcnt_init(&sc->task_refs);
     
     err = iwx_init_hw(sc);
     if (err) {
+        ITLWM_RADIO_MARK(8, err);
         if (generation == sc->sc_generation)
             iwx_stop_device(sc);
         return err;
@@ -10490,30 +10654,44 @@ iwx_init(struct _ifnet *ifp)
     ifq_clr_oactive(&ifp->if_snd);
     ifq_flush(&ifp->if_snd);
     ifp->if_flags |= IFF_RUNNING;
+    ITLWM_RADIO_MARK(9, 0);
     
     if (ic->ic_opmode == IEEE80211_M_MONITOR) {
         ic->ic_bss->ni_chan = ic->ic_ibss_chan;
         ieee80211_new_state(ic, IEEE80211_S_RUN, -1);
+        ITLWM_RADIO_MARK(10, 0);
         return 0;
     }
     
     ieee80211_begin_scan(ifp);
+    ITLWM_RADIO_MARK(11, 0);
     
     /*
      * ieee80211_begin_scan() ends up scheduling iwx_newstate_task().
      * Wait until the transition to SCAN state has completed.
      */
     do {
+        ITLWM_CNT(gItlwmRadioSleeps);
         err = tsleep_nsec(&ic->ic_state, PCATCH, "iwxinit",
             SEC_TO_NSEC(1));
-        if (generation != sc->sc_generation)
+        // Sampled on EVERY iteration, before the two tests below and before iwx_stop drives
+        // ic_state back to INIT. Taking it only inside `if (err)` would give it no value on a
+        // healthy boot, and a counter with no control value cannot be told from a dead one.
+        ITLWM_SET(gItlwmWaitExitState, (uint32_t)ic->ic_state);
+        // Braces are load-bearing: this `if` was unbraced upstream, so a bare statement in
+        // front of the return would make the return unconditional and cost Wi-Fi on every boot.
+        if (generation != sc->sc_generation) {
+            ITLWM_RADIO_MARK(12, ENXIO);
             return ENXIO;
+        }
         if (err) {
+            ITLWM_RADIO_MARK(13, err);
             iwx_stop(ifp);
             return err;
         }
     } while (ic->ic_state != IEEE80211_S_SCAN);
     
+    ITLWM_RADIO_MARK(14, 0);
     return 0;
 }
 
@@ -10612,6 +10790,9 @@ iwx_stop(struct _ifnet *ifp)
     struct ieee80211com *ic = &sc->sc_ic;
     struct iwx_node *in = (struct iwx_node *)ic->ic_bss;
     int i, s = splnet();
+    // Separates the two contributors to sc_generation, which iwx_init (+1) and iwx_stop (+1)
+    // both bump. Note iwx_init_task can reach here WITHOUT iwx_init running.
+    ITLWM_CNT(gItlwmIwxStopCalls);
     
     //    rw_assert_wrlock(&sc->ioctl_rwl);
     
@@ -13458,10 +13639,17 @@ iwx_init_task(void *arg1)
     int s = splnet();
     int generation = sc->sc_generation;
     int fatal = (sc->sc_flags & (IWX_FLAG_HW_ERR | IWX_FLAG_RFKILL));
+    // Counted here rather than past the early return, so 0 means the systq task never ran at
+    // all. The fatal mask must be captured at ITS sampling point too: IWX_FLAG_HW_ERR is
+    // cleared below before the guard consults this pre-sampled copy, so HW_ERR causes a
+    // one-shot skip and then vanishes with no other witness.
+    ITLWM_CNT(gItlwmInitTaskCalls);
+    ITLWM_SET(gItlwmInitTaskFatal, (uint32_t)fatal);
     
     //    rw_enter_write(&sc->ioctl_rwl);
     if (generation != sc->sc_generation) {
         //        rw_exit(&sc->ioctl_rwl);
+        ITLWM_RADIO_MARK(5, 0);
         splx(s);
         return;
     }
@@ -13471,8 +13659,16 @@ iwx_init_task(void *arg1)
     else
         sc->sc_flags &= ~IWX_FLAG_HW_ERR;
     
-    if (!fatal && (ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
+    // The LIVE state the guard is about to test, as one word: low 16 if_flags, high 16
+    // sc_flags. With mark 6 it says which half of the guard rejected.
+    ITLWM_SET(gItlwmInitTaskFlags,
+              (((uint32_t)sc->sc_flags & 0xffff) << 16) |
+              ((uint32_t)ifp->if_flags & 0xffff));
+    if (!fatal && (ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP) {
         that->iwx_init(ifp);
+    } else {
+        ITLWM_RADIO_MARK(6, fatal);
+    }
     
     //    rw_exit(&sc->ioctl_rwl);
     splx(s);
@@ -13519,14 +13715,22 @@ iwx_activate(struct iwx_softc *sc, int act)
             break;
         case DVACT_RESUME:
             err = iwx_resume(sc);
+            // The value the hardcoded `return 0` below throws away. Recorded, not acted on.
+            ITLWM_SET(gItlwmResumeErr, err);
             if (err)
                 XYLog("%s: could not initialize hardware\n",
                       DEVNAME(sc));
             break;
         case DVACT_WAKEUP:
             /* Hardware should be up at this point. */
-            if (iwx_set_hw_ready(sc))
+            // Mark 3 is the silent no-op this whole instrument exists to catch: the task is
+            // never queued, nothing is logged, and IFF_UP has already been latched.
+            if (iwx_set_hw_ready(sc)) {
+                ITLWM_RADIO_MARK(4, 0);
                 task_add(systq, &sc->init_task);
+            } else {
+                ITLWM_RADIO_MARK(3, 0);
+            }
             break;
     }
     

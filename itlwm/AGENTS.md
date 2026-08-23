@@ -85,6 +85,39 @@ ioreg -r -n IOPCIEDeviceWrapper -l -w0 | grep -i itlwm   # the attach-failure co
 
 **Rule: a counter published only from an error path cannot answer a question about success.**
 
+### The enable path is silent end to end — `ItlwmRadioMark` (mechanism 26)
+
+Five consecutive callers discard the outcome of enabling the radio: `iwx_activate` returns a
+hardcoded 0 having computed an error, `ItlIwx::enable` manufactures `kIOReturnSuccess` on both of
+its paths, and `enableAdapter` and `setPOWER` each drop what they are handed. So a failed enable
+reports success at every layer, and **an honest return chain cannot fix that** — `iwx_init` runs on
+the systq thread long after `ItlIwx::enable` returned, so the outcome that matters is asynchronous
+and structurally unreportable through a return value. It has to be latched where it becomes known.
+
+`ITLWM_RADIO_MARK(n, e)` does that: fourteen marks, one per exit of the path, from
+`ItlIwx::enable` through `iwx_activate` and `iwx_init_task` to `iwx_init`'s `ic_state` wait.
+`ItlwmRadioMark0` latches the first **terminal** mark write-once so a recovery toggle cannot
+overwrite it. The full mark table and reading order live in root `AGENTS.md` mechanism 26.
+
+**`ItlIwx::enable` sets `IFF_UP` before it attempts anything and only `ItlIwx::disable` clears it.**
+That makes every failure exit sticky: the next POWER-ON is swallowed by `setPOWER`'s `isRunning`
+gate before it reaches the HAL, and the HAL would refuse it anyway. Nothing retries. This is
+upstream code and in scope for repair, not deletion — but not before the instrument names the
+failure.
+
+**Rule: in `ItlIwx.cpp`, no `gItlwm*` identifier may appear outside a macro** unless it carries its
+own `#if defined(__IO80211_TARGET) && __IO80211_TARGET >= __MAC_26_0`. This file is compiled into
+all ten targets and `__IO80211_TARGET` is undefined for `itlwm.kext`, so a bare store is a compile
+break on nine of them — and the obvious cure, moving the declaration outside the fence its
+definition is inside, is mechanism 25's exact shape. `ITLWM_CNT` and `ITLWM_SET` exist for this.
+The one exception, `gItlwmIcSizeHal` in `iwx_attach`, carries its own fence.
+
+**Braces are load-bearing at two of the mark sites.** `iwx_init`'s
+`if (generation != sc->sc_generation) return ENXIO;` and `iwx_init_task`'s guard were both unbraced
+upstream. Adding a mark in front of either without braces makes the following statement
+unconditional — for the first that is a total loss of Wi-Fi on every boot, from an edit that looks
+inert. Check for the shape at any new site before writing it.
+
 Command-path counters localise a host command that is written to the ring and never
 acknowledged (`ItlwmInitMark == 3`). `ItlwmCmdDoneCount` is incremented in `iwx_cmd_done`
 **before** its `qid != IWX_DQA_CMD_QUEUE` early return, so a response delivered on the wrong

@@ -2819,7 +2819,54 @@ Findings worth keeping from that apparatus, now that it is gone:
   `SIOCSIFFLAGS`, `SIOCADDMULTI`, `SIOCDELMULTI`, `SIOCSIFMTU`, `SIOCSIFLLADDR`, `SIOCSIFCAP`.
   configd's `SIOCGIFMEDIA` polling takes the other branch and cannot reach them.
 
+### The enable path on Tahoe runs through `setPOWER` alone, and its gate is sticky
+
+`AirportItlwm::enable(IO80211SkywalkInterface *)` is compiled out for `__MAC_26_0` (mechanism 5),
+so `setPOWER` is the **only** live caller of `enableAdapter` on Tahoe. That is what makes the
+identity below exact, and it is the wiring self-test for anything added to this path:
+
+```text
+ItlwmSetPowerOn - ItlwmEnableAdapterCalls  ==  ItlwmSetPowerGated
+```
+
+The gate is `isRunning`, computed from `ic_ac.ac_if.if_flags & (IFF_UP | IFF_RUNNING)` — **the
+driver's own `struct _ifnet` inside `ieee80211com`, not the BSD ifnet `ifconfig` prints.** They are
+unrelated storage with no alias between them, and confusing the two makes every reading here wrong.
+`IFF_UP` in that word is set by `ItlIwx::enable` before it attempts anything and cleared only by
+`ItlIwx::disable`, so after a failed enable this gate swallows every later POWER-ON and the radio
+cannot recover itself. Root `AGENTS.md` mechanism 26 has the mark table and the reading order.
+
+`disableAdapter` is the one place all three disable routes meet — `stop()`, `setPOWER`'s off arm,
+and `setPowerStateOff` — which is why `ItlwmDisableCalls` is counted there and nowhere else.
+**`setPowerStateOff` has no `setPowerStateOn` counterpart that re-enables**, so a system sleep
+clears `IFF_UP` and is a second, unattended recovery route; `ItlwmPmOffCalls` is what separates it
+from an operator's toggle, without which every cumulative counter on a boot that slept is
+unattributable.
+
+### `publishRuntimeCounters` — the three-part pattern, and the NULL that lurks in it
+
+Every counter needs all three: a term in the change-guard `&&` chain, a snapshot store, and a
+`setProperty`. Miss the first and the property goes stale; miss the second and a healthy system
+rewrites IORegistry once a second forever.
+
+**Any live read of the HAL here must NULL-guard `OSDynamicCast(ItlIwx, fHalService)`.** One
+AirportItlwm binary per release serves iwx, iwm and iwn — `IOPCIEDeviceWrapper` picks the HAL by
+PCI id — so on an iwm or iwn machine that cast returns NULL. `publishRuntimeCounters` runs from the
+1 Hz watchdog, so an unguarded dereference is a panic about a second after enable, on a kext
+OpenCore injects before the kernel boots, for a class of users the developer's own machine can
+never reproduce. `get80211Controller()` is the base-class accessor and needs no guard; anything
+reached through `iwx->com` does. Hoist the values into locals with a `? :` sentinel of 0 and use
+the locals in all three parts — the guard chain is evaluated before any `if (iwx)` scope could wrap
+it.
+
 ## Verification
+
+**Every new counter must have a known non-zero value on a healthy boot.** A counter whose expected
+healthy reading is 0 cannot be distinguished from one that never fires — which is exactly how
+`gItlwmDisableCalls` was cited as evidence for months while compiling on no target at all (root
+`AGENTS.md` mechanism 26 and the preprocessing check in its Verification section). Where a counter
+is genuinely 0 when healthy, pair it with an adjacent one that is not, or with an arithmetic
+identity like the `setPOWER` one above.
 
 ```bash
 xcodebuild -jobs 8 -target "AirportItlwm-<Release>" -configuration Release build

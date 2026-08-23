@@ -155,6 +155,27 @@ done            # must print NOTHING
 A symbol naming one of our own classes can never be satisfied by any kernel collection, so any hit
 is unambiguously a bug. This caught two unloadable Sonoma kexts; see mechanism 25 for the shape.
 
+**Check that every counter's increment can actually be reached on some target.** A build error
+catches a counter that does not *compile*; nothing catches one whose increment sits under a guard
+that is never true. `gItlwmDisableCalls` had a `#if __IO80211_TARGET >= __MAC_26_0` nested inside a
+`#if __IO80211_TARGET < __MAC_26_0`, compiled on no target, read 0 for months, and was cited as
+evidence in two mechanisms. Preprocess the file with the target's own flags and count the writes —
+this is the check, and it costs one command:
+
+```sh
+RESP=$(ls build/itlwm.build/Release/AirportItlwm-Tahoe.build/Objects-normal/x86_64/*common-args.resp | head -1)
+clang -x c++ -w -E -isysroot "$(xcrun --sdk macosx --show-sdk-path)" -target x86_64-apple-macos10.15 \
+    "@$RESP" -include itlwm/PrivateSPI.pch AirportItlwm/AirportItlwmV2.cpp \
+    | grep -c 'gItlwmYourNewCounter++'      # must be >= 1
+```
+
+**Rule: a counter is not instrumentation until its increment is proved to survive preprocessing.**
+This is the third variant of the same defect — after "set but never published" and "published only
+from a failure path" (both in mechanism 9) comes "incremented only under an unsatisfiable guard".
+The general cure is the same in all three: give every counter a **known non-zero value on a healthy
+boot**, so a dead one is distinguishable from a quiet one. A counter whose expected healthy reading
+is 0 can never be told apart from a counter that does not exist.
+
 **Build clean after changing a struct shared between the stack and a HAL**, above all
 `struct ieee80211com`. It is the first member of every `*_softc`, so its size sets every HAL field's
 offset, and an incremental build that reuses one stale object file produces a kext that links,
@@ -512,46 +533,64 @@ with `ScanBeacons = 1283`, i.e. auto-join still never gets a candidate list (mec
    needs a new hypothesis; mechanism 8 is latent, not active.
 4. **Then the functional gaps** — see the ordering note below.
 
-### Where mechanism 13 stands, and what to do next (checkpoint 2026-08-23)
+### Checkpoint — mechanism 26, and what to do next (2026-08-23)
 
-**The cleanup pass is merged** — PR #3 into `olwimo/itlwm:main`, commit `68ed02e`. Working tree
-since then carries only the mechanism 25 fix plus this documentation.
+**Merged:** the cleanup pass (PR #3, `68ed02e`) and **mechanism 13 plus mechanism 25** (PR #4,
+`fe37785`). Mechanism 13 is BOOTED AND MEASURED WORKING — auto-join succeeded unaided on a machine
+that had never auto-joined once; the counter reconciliation is in its entry.
 
-**Landed and verified since the merge, UNBOOTED:**
-
-- **Mechanism 25** — the unguarded `setWCL_SCAN_REQ` declaration that made both Sonoma kexts
-  unloadable. One header edit; all nine AirportItlwm targets rebuild with zero own-class undefined
-  symbols. This is a genuine shipping-breakage fix and is independent of everything below.
-
-**MECHANISM 13 IS IMPLEMENTED, BOOTED AND MEASURED WORKING.** Auto-join succeeded unaided on a
-machine that had never auto-joined once; full numbers and the exact counter reconciliation are in
-mechanism 13's entry. Verified before boot: clean build of all ten targets, 0 own-class undefined
-symbols on every target, 0 unresolved against the running 25G83 (952 undefined, +1 =
-`OSCompareAndSwap`), `mapdrv` 211 + 45 correct / 0 wrong, `callcheck` 94 slots / 0 wrong.
-
-**Two entries changed status as a result, both in the same direction — a claimed blocker that
-was not one:**
+**Two entries changed status with it, both the same way — a claimed blocker that was not one:**
 
 - **Mechanism 24 is REFUTED and demoted.** Auto-join works with message 55 never sent.
-- **Mechanism 26 is new**: the `IEEE80211_S_INIT` boot race, which is pre-existing (confirmed by
-  boot comparison against the old kext) and is what made two boots unmeasurable. One Wi-Fi power
-  toggle recovers it.
+- **Mechanism 26** is the `IEEE80211_S_INIT` boot race, pre-existing (confirmed by boot comparison
+  against the old kext) and what made two boots unmeasurable. One Wi-Fi toggle recovers it.
+
+**LANDED SINCE, UNBOOTED — mechanism 26's instrument.** The mechanism is now confirmed by reading
+the path: a failed enable is silent *and* sticky, because `ItlIwx::enable` sets `IFF_UP` before it
+attempts anything and only `ItlIwx::disable` ever clears it, which latches both recovery gates.
+Which sub-step fails is still unknown, so this ships an instrument and **no behaviour change** —
+`ItlwmRadioMark0` names which of fourteen exits the enable path took. Full reading order in
+mechanism 26.
+
+**The DOX's own prescribed next step was wrong and is superseded.** It said to add
+`ItlwmEnableCalls`/`ItlwmEnableRet`. `ItlwmEnableRet` as specified is useless: `ItlIwx::enable`
+returns `kIOReturnSuccess` unconditionally, `iwx_activate` returns a hardcoded 0 having computed an
+error, and three more callers discard what they are handed — so it would read 0 on a stalled boot
+and a healthy one alike. And an honest return chain could not fix that, because `iwx_init` runs on
+the systq thread after every one of those callers has returned.
+
+**Two counters were found to be void while doing it**, and one is a genuine defect fixed here:
+`ItlwmDisableCalls` compiled on **no target** (guard nested inside its own negation) and read 0
+unconditionally while being cited as evidence in mechanisms 15 and 26; and `ItlwmInitMark = 7` is
+an attach-time value that reads identically on a healthy and a stalled boot. See mechanism 26 and
+the new preprocessing check in **Verification**.
+
+Verified before boot: all ten targets build, 0 own-class/`gItlwm` undefined symbols on every target
+including `itlwm.kext`, 952 undefined against the archived 25G83 with 0 missing (unchanged — this
+adds no external symbols), `mapdrv` 211 + 45 correct / 0 wrong, `callcheck` 94 slots / 0 wrong, and
+every new increment proved to survive preprocessing.
 
 **Next steps, in order:**
 
-1. **Commit mechanism 13** — the working tree carries it plus mechanism 25 plus this
-   documentation, and nothing is committed yet.
-2. **Mechanism 26**, because it is now the top user-visible defect: a boot that comes up with no
-   Wi-Fi until you toggle it. Add `ItlwmEnableCalls`/`ItlwmEnableRet` first — the stall is
-   currently indistinguishable from "enable never called", and one boot with those two counters
-   settles which.
+1. **Boot the instrument and read `ItlwmRadioMark0`.** A healthy boot is still worth having — it
+   validates the instrument against the known-good row in mechanism 26, and until that row is
+   confirmed no stalled reading means anything.
+2. **Then repair the exit Mark0 names.** Separately decide whether the *stickiness* deserves its
+   own repair, since it is a bug whichever sub-step fires — but it is upstream HAL code on the path
+   the machine's Wi-Fi depends on. **Do not repair and instrument in the same boot cycle.**
 3. **Then the remaining functional gaps**: 20 (LQM rate group — cheapest, the driver already has
    the number), 17 (`networksetup` association report), 18 (roaming), 22 (Private Wi-Fi Address =
-   Off). Mechanism 14 (scan request parameters) is now unblocked, since completion finally
-   corresponds to a real sweep.
+   Off). Mechanism 14 (scan request parameters) is unblocked now that completion corresponds to a
+   real sweep.
 
 **Whenever a boot shows `ItlwmScanReqState = 0` with `Refused == Calls`, stop and read mechanism
 26 before concluding anything about scanning.** That state can measure nothing about the scan path.
+
+**A boot that needed a toggle is NOT a healthy reference.** The session this instrument was written
+on booted at 05:19:43, was toggled by hand at 05:28:18, and afterwards read `ScanReqCalls = 412 /
+Refused = 360` — 360 refusals accumulated during the stall, on a machine that looked perfectly
+healthy by the time anyone read it. Check `kern.boottime` against `SET POWER OFF request received`
+in `airportd`'s log before treating any counter as a baseline.
 
 ### Deliberately NOT removed, so it is not re-proposed
 
@@ -2343,7 +2382,10 @@ every `ITLWM_*_OFFSET`, and every `Itlwm*` counter.
     Restored. `ItlwmLinkDownState` sampled `ic_state` in `setLinkStatus` and read RUN, which is
     ambiguous — at least three different causes read RUN there. Replacing the deduction with
     `ItlwmLinkDownPair` (`(ostate << 16) | (nstate << 8) | mgt`) **named the edge in one boot:
-    `0x030410`, ASSOC → RUN with `mgt` `ASSOC_RESP`, and `ItlwmDisableCalls = 0`.** The link-down
+    `0x030410`, ASSOC → RUN with `mgt` `ASSOC_RESP`.** (This once also cited `ItlwmDisableCalls = 0`
+    as corroboration. That counter compiled on no target and read 0 unconditionally — see mechanism
+    26 — so the corroboration is struck; the conclusion rests on `ItlwmLinkDownPair` and stands.)
+    The link-down
     the WCL acted on was emitted by the transition that *completes* the association, not by any
     loss of one. Both earlier guards are superseded by one predicate in `ieee80211_set_link_state`,
     the function that owns `if_link_state`: **never report the link down while `ic_state ==
@@ -2916,43 +2958,137 @@ every `ITLWM_*_OFFSET`, and every `Itlwm*` counter.
     every other release that builds the same file. The pre-Tahoe targets are not covered by the
     Tahoe symbol check, so nothing else would have caught it.
 
-26. **INTERMITTENT BOOT RACE: net80211 never leaves `IEEE80211_S_INIT`, so the radio never comes
-    up.** Newly separated out, because it masqueraded as a scan bug twice and cost a measurement
-    cycle each time.
+26. **INTERMITTENT BOOT RACE: a failed enable is silent AND sticky, so the radio never comes up
+    and cannot recover itself.** The mechanism is now confirmed; which sub-step fails is not.
 
     Signature, all readable in one `ioreg`:
 
     ```text
     ItlwmScanReqState = 0        (IEEE80211_S_INIT)   ItlwmScanBeacons = 0
     ItlwmScanReqRefused == ItlwmScanReqCalls          ItlwmScanReqStarted = 0
-    ItlwmInitMark = 7, ItlwmInitErr = 0, ItlwmInitComplete = 1     <- attach-time init ucode is FINE
+    ItlwmInitMark = 7, ItlwmInitErr = 0, ItlwmInitComplete = 1     <- says NOTHING; see below
     ItlwmSkywalkStage = 11, QueuesEnabled = 4, RxFree = 255        <- the data path is FINE
     en3 UP,RUNNING but `status: inactive`;  Country Code: ZZ, Locale: Unknown
     networksetup -getairportpower en3 -> On;  IOC_POWER Set returns GOOD
     ```
 
-    So the kext loads, registers, builds the Skywalk data path and answers ioctls, and the *radio*
-    is simply never brought up: `enable()` / `iwx_init` does not complete, `ic_state` stays 0, and
-    `beginScanGated` correctly refuses every scan. **`Country Code: ZZ` is the fastest tell** — a
-    working boot reports `DE/ETSI` with 38 channels.
+    **`Country Code: ZZ` is the fastest tell** — a working boot reports `DE/ETSI` with 38 channels.
+    Recovery is one Wi-Fi off/on toggle, every time. **PRE-EXISTING, NOT caused by mechanism 13** —
+    confirmed by boot comparison: the 01:05:44 boot ran the *pre*-mechanism-13 kext and shows the
+    identical signature while the 23:33 boot on the same build worked normally.
 
-    **It is a race, not a hard fault, and the recovery is one command:** toggling Wi-Fi off and on
-    (`sudo networksetup -setairportpower en3 off; ... on`, or the menu bar) re-runs `enableAdapter`
-    → `iwx_init` and the driver comes fully to life — measured 2026-08-23, after which the same
-    boot scanned, auto-joined and held a DHCP lease.
+    ### The mechanism, CONFIRMED by reading the path line by line
 
-    **PRE-EXISTING, NOT CAUSED BY MECHANISM 13.** Confirmed by boot comparison: the 01:05:44 boot
-    ran the *pre*-mechanism-13 kext and shows the identical signature (`scanResultsCount=0`, the
-    SCAN_MANAGER cycling through `SCAN_REQ_FAILED`), while the 23:33 boot on the same build worked
-    normally. Do not attribute it to whatever change is newest.
+    On Tahoe `AirportItlwm::enable(IO80211SkywalkInterface *)` is compiled out (mechanism 5), so the
+    only live route to the radio is `setPOWER` -> `enableAdapter` -> `ItlIwx::enable`:
 
-    *Where to look:* `AirportItlwm::enableAdapter` → `fHalService->enable()` → `iwx_activate`/
-    `iwx_init`, and what `setPOWER` does when it arrives before the interface is ready. Note
-    `ItlwmDisableCalls = 0` on a stalled boot, so nothing disabled it afterwards — the enable
-    either never ran or returned without starting the radio. **There is no counter for it**, which
-    is the first thing to fix: an `ItlwmEnableCalls`/`ItlwmEnableRet` pair would distinguish "never
-    called" from "called and failed" in one boot, and neither is currently distinguishable.
-    **Done when** ten consecutive boots reach `ItlwmScanReqState != 0` without a power toggle.
+    ```text
+    setPOWER            gated on !(ic_ac.ac_if.if_flags & (IFF_UP|IFF_RUNNING))
+      enableAdapter                     discards the return
+        ItlIwx::enable                  SETS IFF_UP, then returns kIOReturnSuccess ALWAYS
+          iwx_activate(DVACT_RESUME)    iwx_resume's error is XYLog'd (no sink) and dropped
+          iwx_activate(DVACT_WAKEUP)    if (iwx_set_hw_ready) task_add(systq, &init_task)
+                                        ^ a SILENT no-op when false
+            iwx_init_task               runs iwx_init only if (flags & (UP|RUNNING)) == UP
+              iwx_init                  iwx_init_hw, IFF_RUNNING, begin_scan, then a 1 s
+                                        tsleep loop for ic_state == SCAN; on error iwx_stop
+                                        and return err — discarded by every caller above
+    ```
+
+    **`ItlIwx::enable` sets `IFF_UP` BEFORE it attempts anything, and the only code in the whole
+    build that clears it is `ItlIwx::disable`.** `iwx_stop` clears `IFF_RUNNING` only. So *every*
+    failure exit lands at `if_flags == 0x8807` and latches **both** recovery gates at once:
+    `setPOWER`'s `isRunning` test swallows the next POWER-ON before it reaches the HAL, and
+    `ItlIwx::enable` would refuse it anyway with "already in activating state". Nothing retries.
+    The OFF leg of a toggle is *enabled* by the same stuck bit — `setPOWER`'s off arm is gated on
+    `isRunning` being **true** — so it runs `disableAdapter` -> `ItlIwx::disable`, clears `IFF_UP`,
+    and the following ON passes both gates. That is exactly and completely the one-toggle recovery.
+
+    **A system sleep is a second, unattended recovery route.** `setPowerStateOff` calls
+    `disableAdapter` with no ioctl involved, and `setPowerStateOn` does *not* re-enable — the pair
+    is asymmetric. So a lid-close clears `IFF_UP` too, and on a boot that slept every cumulative
+    counter is unattributable without `ItlwmPmOffCalls`.
+
+    ### Two pieces of this entry's own former evidence were VOID
+
+    - **`ItlwmDisableCalls = 0` proved nothing.** Its only increment sat in
+      `AirportItlwm::disable(IO80211SkywalkInterface *)` under `#if __IO80211_TARGET >= __MAC_26_0`
+      **nested inside** the `#if __IO80211_TARGET < __MAC_26_0` that compiles that whole method out
+      on Tahoe. Mutually exclusive conditions: it compiled on **no target at all**, and the property
+      read 0 on every boot, healthy or stalled, while being cited as evidence. Now fixed — the
+      increment lives in `disableAdapter`, which is on all three disable routes. **Mechanism 15's
+      `0x030410` diagnosis cited it as corroboration; that half is struck.** The conclusion there
+      rests on `ItlwmLinkDownPair` and still stands.
+    - **`ItlwmInitMark = 7 / InitComplete = 1` says nothing about the enable path.** Every
+      `ITLWM_INIT_MARK` site is inside `iwx_run_init_mvm_ucode`. Live read on this machine while
+      *associated*: `ItlwmInitMark = 7`, `ItlwmPreinitMark = 3` — the same values the stalled
+      signature reports. They are not a discriminator and never were.
+
+    **And "IOC_POWER Set returns GOOD" is manufactured by the driver.** Five consecutive callers
+    discard the outcome, so that line is evidence of nothing. Worse, an honest return chain
+    *cannot* fix it: `iwx_init` runs on the systq thread long after `ItlIwx::enable` returned, so
+    the outcome that matters is asynchronous and structurally unreportable through a return value.
+    It has to be latched where it becomes known.
+
+    ### LANDED: `ItlwmRadioMark`, instrument-only. UNBOOTED.
+
+    Fourteen marks name every exit of the enable path; `ItlwmRadioMark0` latches the **first
+    terminal** one write-once, so a recovery toggle cannot overwrite the reading that matters.
+    No behaviour change anywhere — integer stores on cold paths, plus braces on two upstream
+    `if`s that had none. It cannot panic and cannot break a working session.
+
+    **Read `ItlwmRadioMark0` FIRST and route on it alone.** Everything else is corroboration.
+
+    | Mark0 | meaning | next thing to read |
+    | --- | --- | --- |
+    | 0 | `ItlIwx::enable` never ran, or nothing terminal followed | `ItlwmEnableCalls`, `ItlwmSetPowerOn` |
+    | 2 | refused: `IFF_UP` already set on entry | `ItlwmSetPowerGated` |
+    | 3 | **`iwx_set_hw_ready()` false — `init_task` NEVER QUEUED** | `ItlwmResumeErr` |
+    | 5 | stale generation in `iwx_init_task` | `ItlwmGenLive`, `ItlwmIwxStopCalls` |
+    | 6 | `init_task`'s guard rejected | `ItlwmInitTaskFatal` (**a `sc_flags` mask, not an errno**), `ItlwmInitTaskFlags` |
+    | 8 | `iwx_init_hw()` failed | `ItlwmRadioErr0` (errno), then `ItlwmPreinitMark`/`ItlwmInitMark`, which the *enable-path* call rewrites |
+    | 12 | generation changed during the `ic_state` wait | `ItlwmIwxStopCalls` |
+    | 13 | the 1 s `ic_state` wait failed | `ItlwmRadioSleeps`, `ItlwmScanStateWakes`, `ItlwmWaitExitState` |
+    | 14 | **SUCCESS** | nothing — this is the healthy value |
+
+    **`Mark0 = 14` on a healthy boot IS the self-test.** Success is in the terminal set precisely
+    so the instrument has a non-zero control value: a counter whose expected healthy reading is 0
+    cannot be told apart from a dead one, which is how `ItlwmDisableCalls` survived for months.
+    Any other Mark0 on a boot whose Wi-Fi works means the instrument is wrong and **no stalled
+    reading may be trusted**.
+
+    Three more readings that are load-bearing, and one arithmetic identity:
+
+    - **`ItlwmIfFlags` is the cheapest falsifier in the set.** `iwx_attach` writes `0x8806`; a
+      stalled boot MUST read **`0x8807`** and healthy running **`0x8847`**. `0x8806` on a stall
+      refutes the sticky-`IFF_UP` claim outright. This is the driver's own `struct _ifnet` inside
+      `ieee80211com`, **not** the BSD ifnet `ifconfig` prints — unrelated storage, no alias.
+    - **`ItlwmSetPowerOn - ItlwmEnableAdapterCalls` MUST equal `ItlwmSetPowerGated`.** On Tahoe
+      `setPOWER` is `enableAdapter`'s only caller, so this is exact. A disagreement means the
+      wiring is wrong rather than the driver — discard the boot.
+    - **`ItlwmInitAttempts > 1` means every cumulative counter is a SUM.** Ten sites re-dispatch
+      `init_task` with no second `ItlIwx::enable`, so an attempt counter does not bound an attempt
+      — which is why Mark0 latches on the first terminal mark instead. Read Mark0 and stop.
+    - **`ItlwmDisableCalls > ItlwmSetPowerOff`** means a PM sleep disabled the adapter; check
+      `ItlwmPmOffCalls`. That is not a disqualifier, it is the second recovery route.
+
+    **On an iwm or iwn machine every HAL counter here reads 0 by construction**, and
+    `ItlwmGenLive`/`ItlwmScFlagsLive` read 0 as the not-an-`ItlIwx` sentinel. Check
+    `ItlwmDeviceFamily` before reading anything into a zero.
+
+    ### Next steps, in order
+
+    1. **Boot it and read `ItlwmRadioMark0`.** The bug is intermittent, so a healthy boot is still
+       useful: it validates the instrument (`Mark0 = 14`, `ItlwmIfFlags = 0x8847`,
+       `ItlwmWaitExitState = 1`, `ItlwmRadioSleeps = 1`, `ItlwmInitTaskCalls = 1`). Only once that
+       row is confirmed does a stalled reading mean anything.
+    2. **Then repair the exit Mark0 names** — and separately decide whether the *stickiness* is
+       worth repairing on its own, since it is a bug whichever sub-step fires. The obvious candidate
+       is clearing `IFF_UP` when the enable did not reach mark 14, but that is upstream HAL code on
+       the path the machine's Wi-Fi depends on, and it must not ship before the instrument has
+       named the failure. **Do not repair and instrument in the same boot cycle.**
+
+    **Done when** ten consecutive boots reach `ItlwmIcStateLive != 0` with no power toggle.
 
 ## DOX framework
 

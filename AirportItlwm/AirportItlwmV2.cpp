@@ -86,6 +86,22 @@ extern uint32_t gItlwmIctResetAtIsr;
 extern uint32_t gItlwmIctResetAtKick;
 extern uint32_t gItlwmIctPaddrLo;
 extern uint32_t gItlwmIctTblReg;
+// Mechanism 26. iwx-only: on an iwm or iwn machine every one of these reads 0 by construction.
+extern int gItlwmRadioMark;
+extern int gItlwmRadioErr;
+extern int gItlwmRadioMark0;
+extern int gItlwmRadioErr0;
+extern uint32_t gItlwmEnableCalls;
+extern uint32_t gItlwmEnableRefused;
+extern int gItlwmResumeErr;
+extern uint32_t gItlwmInitTaskCalls;
+extern uint32_t gItlwmInitTaskFatal;
+extern uint32_t gItlwmInitTaskFlags;
+extern uint32_t gItlwmInitAttempts;
+extern uint32_t gItlwmWaitExitState;
+extern uint32_t gItlwmScanStateWakes;
+extern uint32_t gItlwmRadioSleeps;
+extern uint32_t gItlwmIwxStopCalls;
 }
 extern "C" {
 extern uint32_t gItlwmPrepareBSDUngated;
@@ -126,6 +142,12 @@ extern uint32_t gItlwmLinkIndDown;
 extern uint32_t gItlwmLinkDownState;
 extern uint32_t gItlwmLinkDownPair;
 extern uint32_t gItlwmDisableCalls;
+extern uint32_t gItlwmSetPowerOn;
+extern uint32_t gItlwmSetPowerOff;
+extern uint32_t gItlwmSetPowerGated;
+extern uint32_t gItlwmEnableAdapterCalls;
+extern uint32_t gItlwmEnableAdapterRet;
+extern uint32_t gItlwmPmOffCalls;
 extern uint32_t gItlwmCCPipesStarted;
 extern uint32_t gItlwmCCPipeStartFail;
 extern uint32_t gItlwmLeaveNetCalls;
@@ -458,6 +480,10 @@ static uint32_t sLastSkywalkStage, sLastSkywalkTxDequeue, sLastSkywalkRxDequeue;
 static uint32_t sLastLqmPostBucket, sLastLqmBeaconStall;
 static uint32_t sLastScanFailDes, sLastScanFailOr, sLastEssClears, sLastAssocEsslen;
 static uint32_t sLastScanDoneEvents, sLastScanCompletes, sLastScanBackstops, sLastScanLastMs;
+// Mechanism 26.
+static uint32_t sLastRadioMark, sLastEnableCalls, sLastInitTaskCalls, sLastIwxStopCalls;
+static uint32_t sLastSetPowerOn, sLastSetPowerOff, sLastEnableAdapterCalls, sLastPmOffCalls;
+static uint32_t sLastIfFlags, sLastIcStateLive, sLastScFlagsLive;
 static bool sPublishedOnce;
 
 void AirportItlwm::publishRuntimeCounters()
@@ -486,6 +512,19 @@ void AirportItlwm::publishRuntimeCounters()
         setProperty("ItlwmIcSizeNet", (UInt64)gItlwmIcSizeNet, 32);
         setProperty("ItlwmPrepareBSDUngated", (UInt64)gItlwmPrepareBSDUngated, 32);
     }
+    // Mechanism 26 — live state, sampled once per watchdog tick, no HAL edit and no storage.
+    // get80211Controller() is the base-class accessor and is already dereferenced unguarded in
+    // the change guard below, so it needs no test. THE ItlIwx CAST DOES: the Tahoe kext ships
+    // all three HALs and IOPCIEDeviceWrapper picks one by PCI id, so on an iwm or iwn machine
+    // this cast returns NULL. An unguarded dereference here would fault on the first watchdog
+    // tick — about a second after enable, on a kext OpenCore injects before the kernel boots,
+    // for a whole class of users the developer's own machine can never reproduce.
+    struct ieee80211com *icLive = fHalService->get80211Controller();
+    uint32_t ifFlagsLive = (uint32_t)icLive->ic_ac.ac_if.if_flags;
+    uint32_t icStateLive = (uint32_t)icLive->ic_state;
+    ItlIwx *iwxLive = OSDynamicCast(ItlIwx, fHalService);
+    uint32_t genLive = iwxLive ? (uint32_t)iwxLive->com.sc_generation : 0;
+    uint32_t scFlagsLive = iwxLive ? (uint32_t)iwxLive->com.sc_flags : 0;
     if (gItlwmPostMsgQueued == sLastPostQueued &&
         gItlwmPostMsgSent == sLastPostSent &&
         gItlwmPostMsgDropped == sLastPostDropped &&
@@ -531,8 +570,30 @@ void AirportItlwm::publishRuntimeCounters()
         gItlwmSkywalkStage == sLastSkywalkStage &&
         gItlwmSkywalkTxDequeue == sLastSkywalkTxDequeue &&
         gItlwmSkywalkRxDequeue == sLastSkywalkRxDequeue &&
-        gItlwmLastQueueTimeCalls == sLastQueueTimeCalls)
+        gItlwmLastQueueTimeCalls == sLastQueueTimeCalls &&
+        (uint32_t)gItlwmRadioMark == sLastRadioMark &&
+        gItlwmEnableCalls == sLastEnableCalls &&
+        gItlwmInitTaskCalls == sLastInitTaskCalls &&
+        gItlwmIwxStopCalls == sLastIwxStopCalls &&
+        gItlwmSetPowerOn == sLastSetPowerOn &&
+        gItlwmSetPowerOff == sLastSetPowerOff &&
+        gItlwmEnableAdapterCalls == sLastEnableAdapterCalls &&
+        gItlwmPmOffCalls == sLastPmOffCalls &&
+        ifFlagsLive == sLastIfFlags &&
+        icStateLive == sLastIcStateLive &&
+        scFlagsLive == sLastScFlagsLive)
         return;
+    sLastRadioMark = (uint32_t)gItlwmRadioMark;
+    sLastEnableCalls = gItlwmEnableCalls;
+    sLastInitTaskCalls = gItlwmInitTaskCalls;
+    sLastIwxStopCalls = gItlwmIwxStopCalls;
+    sLastSetPowerOn = gItlwmSetPowerOn;
+    sLastSetPowerOff = gItlwmSetPowerOff;
+    sLastEnableAdapterCalls = gItlwmEnableAdapterCalls;
+    sLastPmOffCalls = gItlwmPmOffCalls;
+    sLastIfFlags = ifFlagsLive;
+    sLastIcStateLive = icStateLive;
+    sLastScFlagsLive = scFlagsLive;
     sLastSkywalkStage = gItlwmSkywalkStage;
     sLastSkywalkTxDequeue = gItlwmSkywalkTxDequeue;
     sLastSkywalkRxDequeue = gItlwmSkywalkRxDequeue;
@@ -725,6 +786,84 @@ void AirportItlwm::publishRuntimeCounters()
     setProperty("ItlwmLastRxActivityCalls", (UInt64)gItlwmLastRxActivityCalls, 32);
     setProperty("ItlwmSlot450Calls", (UInt64)gItlwmDataPathPeerStatsCalls, 32);
     setProperty("ItlwmSlot451Calls", (UInt64)gItlwmLastQueueTimeCalls, 32);
+    // ---------------------------------------------------------------- mechanism 26
+    // READ ItlwmRadioMark0 FIRST AND ROUTE ON IT ALONE. It is the first TERMINAL exit the
+    // enable path took, latched write-once so a recovery toggle cannot overwrite it, and it
+    // names the exit unambiguously. Everything else here is corroboration.
+    //
+    //   0  ItlIwx::enable never ran, or ran and nothing terminal followed
+    //   2  refused: IFF_UP was already set when the HAL was entered
+    //   3  iwx_set_hw_ready() false at DVACT_WAKEUP — init_task NEVER QUEUED
+    //   5  stale generation in iwx_init_task
+    //   6  init_task's guard rejected; Err0 is the sc_flags FATAL MASK, not an errno
+    //   8  iwx_init_hw() failed; Err0 is its errno
+    //  10  monitor mode (unreachable for M_STA)
+    //  12  generation changed during the ic_state wait
+    //  13  the 1 s ic_state wait failed; Err0 is the tsleep errno (35 = EWOULDBLOCK)
+    //  14  SUCCESS — iwx_init completed and net80211 reached SCAN
+    //
+    // A HEALTHY boot reads Mark0 = 14. THAT IS THE SELF-TEST: any other value on a boot whose
+    // Wi-Fi works means the instrument is wrong and no stalled reading may be trusted. It is
+    // also why 14 is in the terminal set — a counter whose expected healthy value is 0 cannot
+    // be told apart from a counter that is dead, which is exactly how ItlwmDisableCalls
+    // survived for months.
+    //
+    // ItlwmInitAttempts > 1 means every cumulative counter here is a SUM over several attempts;
+    // read Mark0 and stop. ItlwmDisableCalls > ItlwmSetPowerOff means a PM sleep disabled the
+    // adapter, which is a second unattended recovery route — check ItlwmPmOffCalls.
+    //
+    // ON AN iwm OR iwn MACHINE every HAL counter below reads 0 by construction, and
+    // ItlwmGenLive/ItlwmScFlagsLive read 0 as the not-an-ItlIwx sentinel. Check
+    // ItlwmDeviceFamily before concluding anything from a zero.
+    setProperty("ItlwmRadioMark0", (UInt64)gItlwmRadioMark0, 32);
+    setProperty("ItlwmRadioErr0", (UInt64)gItlwmRadioErr0, 32);
+    setProperty("ItlwmRadioMark", (UInt64)gItlwmRadioMark, 32);
+    setProperty("ItlwmRadioErr", (UInt64)gItlwmRadioErr, 32);
+    setProperty("ItlwmInitAttempts", (UInt64)gItlwmInitAttempts, 32);
+    setProperty("ItlwmEnableCalls", (UInt64)gItlwmEnableCalls, 32);
+    setProperty("ItlwmEnableRefused", (UInt64)gItlwmEnableRefused, 32);
+    setProperty("ItlwmResumeErr", (UInt64)gItlwmResumeErr, 32);
+    setProperty("ItlwmInitTaskCalls", (UInt64)gItlwmInitTaskCalls, 32);
+    // The fatal mask AS SAMPLED at the top of iwx_init_task: 0x02 RFKILL, 0x80 HW_ERR. It
+    // cannot be recovered any other way — HW_ERR is cleared before the guard consults the
+    // pre-sampled copy, so it causes a one-shot skip and then vanishes.
+    setProperty("ItlwmInitTaskFatal", (UInt64)gItlwmInitTaskFatal, 32);
+    // The LIVE state the guard tested: low 16 if_flags, high 16 sc_flags. With Mark0 = 6 and
+    // Fatal = 0, this says the guard rejected on the if_flags half instead.
+    setProperty("ItlwmInitTaskFlags", (UInt64)gItlwmInitTaskFlags, 32);
+    // With Mark0 = 13: Sleeps 1 is a single clean 1 s timeout. ScanStateWakes 0 means the scan
+    // never reached the wake at all, which is a different repair from a lost wakeup.
+    // WaitExitState is ic_state sampled after every tsleep and before iwx_stop resets it —
+    // 1 (SCAN) means the wait had in fact been satisfied and the code tore down a device that
+    // had succeeded. It reads 1 on a healthy boot, which is what gives it a control value.
+    setProperty("ItlwmRadioSleeps", (UInt64)gItlwmRadioSleeps, 32);
+    setProperty("ItlwmScanStateWakes", (UInt64)gItlwmScanStateWakes, 32);
+    setProperty("ItlwmWaitExitState", (UInt64)gItlwmWaitExitState, 32);
+    setProperty("ItlwmIwxStopCalls", (UInt64)gItlwmIwxStopCalls, 32);
+    // SetPowerOn - EnableAdapterCalls MUST equal SetPowerGated. A disagreement means the wiring
+    // is wrong, not the driver — discard the boot rather than reading anything into it.
+    setProperty("ItlwmSetPowerOn", (UInt64)gItlwmSetPowerOn, 32);
+    setProperty("ItlwmSetPowerOff", (UInt64)gItlwmSetPowerOff, 32);
+    setProperty("ItlwmSetPowerGated", (UInt64)gItlwmSetPowerGated, 32);
+    setProperty("ItlwmEnableAdapterCalls", (UInt64)gItlwmEnableAdapterCalls, 32);
+    setProperty("ItlwmEnableAdapterRet", (UInt64)gItlwmEnableAdapterRet, 32);
+    setProperty("ItlwmPmOffCalls", (UInt64)gItlwmPmOffCalls, 32);
+    // THE STICKINESS WITNESS, and the cheapest falsifier in the set. This is the DRIVER's own
+    // struct _ifnet inside ieee80211com, NOT the BSD ifnet `ifconfig en3` prints — unrelated
+    // storage with no alias between them. iwx_attach writes 0x8806. A stalled boot MUST read
+    // 0x8807 (IFF_UP added, IFF_RUNNING absent); healthy running reads 0x8847. 0x8806 on a
+    // stalled boot refutes the sticky-IFF_UP claim outright.
+    setProperty("ItlwmIfFlags", (UInt64)ifFlagsLive, 32);
+    // Read live, so unlike ItlwmScanReqState it survives a boot where airportd never asks and
+    // is not overwritten by the recovery toggle. 0 INIT 1 SCAN 2 AUTH 3 ASSOC 4 RUN.
+    setProperty("ItlwmIcStateLive", (UInt64)icStateLive, 32);
+    // sc_generation = (iwx_init entries) + (iwx_stop entries); use ItlwmIwxStopCalls to
+    // separate them, and note iwx_init_task can call iwx_stop without iwx_init running at all.
+    // NOT the same as ItlwmGeneration, which is frozen at attach time.
+    setProperty("ItlwmGenLive", (UInt64)genLive, 32);
+    // 0x02 RFKILL still latched. 0x100 SHUTDOWN STUCK — iwx_add_task refuses every task while
+    // it is set, so a stuck SHUTDOWN is its own candidate and this is its only witness.
+    setProperty("ItlwmScFlagsLive", (UInt64)scFlagsLive, 32);
 }
 #endif
 
@@ -2196,14 +2335,11 @@ IOReturn AirportItlwm::enable(IO80211SkywalkInterface *netif)
 IOReturn AirportItlwm::disable(IO80211SkywalkInterface *netif)
 {
     XYLog("%s\n", __PRETTY_FUNCTION__);
-    // TEMPORARY instrumentation (mechanism 9). This is the *other* way a link-down reaches the
-    // WCL, and it is indistinguishable from net80211's at the point it is posted: it drops the
-    // link while ic_state is whatever net80211 last set, so it reads as RUN during an association
-    // and looks exactly like a spurious transition. Non-zero here means the family disabled the
-    // interface and the teardown is not net80211's doing at all.
-#if __IO80211_TARGET >= __MAC_26_0
-    gItlwmDisableCalls++;
-#endif
+    // gItlwmDisableCalls used to be incremented here, under a `#if __IO80211_TARGET >=
+    // __MAC_26_0` nested inside the `#if __IO80211_TARGET < __MAC_26_0` that encloses this whole
+    // method — mutually exclusive, so it compiled on no target and the property read 0 for its
+    // whole life while being cited as evidence. The increment now lives in disableAdapter, which
+    // is on every disable route and is not fenced against itself. Mechanism 26.
     super::disable(netif);
     setLinkStatus(kIONetworkLinkValid);
     return kIOReturnSuccess;
@@ -2752,17 +2888,34 @@ setPOWER(OSObject *object,
         return kIOReturnError;
     IOLog("itlwm: setPOWER: num_radios[%d]  power_state(0:%u  1:%u  2:%u  3:%u)\n", pd->num_radios, pd->power_state[0], pd->power_state[1], pd->power_state[2], pd->power_state[3]);
     if (pd->num_radios > 0) {
+        // MECHANISM 26. `isRunning` is the AirportItlwm half of the sticky latch: it is computed
+        // from the DRIVER's own struct _ifnet inside ieee80211com (not the BSD ifnet `ifconfig`
+        // prints), whose IFF_UP is set by ItlIwx::enable before it attempts anything and cleared
+        // only by ItlIwx::disable. So after any failed enable this test is true forever, a
+        // POWER-ON is swallowed here without reaching the HAL, and the radio can never
+        // self-recover. Instrumented, deliberately not changed: see the entry in AGENTS.md.
         bool isRunning = (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & (IFF_UP | IFF_RUNNING)) != 0;
         if (pd->power_state[0] == 0) {
+#if __IO80211_TARGET >= __MAC_26_0
+            gItlwmSetPowerOff++;
+#endif
             changePowerStateToPriv(1);
             if (isRunning) {
                 net80211_ifstats(fHalService->get80211Controller());
                 disableAdapter(bsdInterface);
             }
         } else {
+#if __IO80211_TARGET >= __MAC_26_0
+            gItlwmSetPowerOn++;
+#endif
             changePowerStateToPriv(2);
-            if (!isRunning)
+            if (!isRunning) {
                 enableAdapter(bsdInterface);
+            } else {
+#if __IO80211_TARGET >= __MAC_26_0
+                gItlwmSetPowerGated++;
+#endif
+            }
         }
         power_state = (pd->power_state[0]);
     }
@@ -2805,9 +2958,23 @@ SInt32 AirportItlwm::apple80211SkywalkRequest(UInt request,int cmd,IO80211Skywal
 
 IOReturn AirportItlwm::enableAdapter(IONetworkInterface *netif)
 {
+#if __IO80211_TARGET >= __MAC_26_0
+    gItlwmEnableAdapterCalls++;
+    // The IOReturn that actually crosses the HAL boundary, discarded before this edit and still
+    // not acted on. It is 0 by construction on current code — ItlIwx::enable manufactures
+    // kIOReturnSuccess on both of its paths — so a non-zero reading means somebody changed that
+    // and the assumptions behind ItlwmRadioMark need re-reading. Stored AFTER the watchdog is
+    // armed so no future edit here can skip the arming; publishRuntimeCounters runs only from
+    // watchdogAction, so an unarmed watchdog publishes nothing at all.
+    IOReturn halRet = fHalService->enable(netif);
+    watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
+    watchdogTimer->enable();
+    gItlwmEnableAdapterRet = (uint32_t)halRet;
+#else
     fHalService->enable(netif);
     watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
     watchdogTimer->enable();
+#endif
     return kIOReturnSuccess;
 }
 
@@ -2816,6 +2983,11 @@ void AirportItlwm::disableAdapter(IONetworkInterface *netif)
     watchdogTimer->cancelTimeout();
     watchdogTimer->disable();
 #if __IO80211_TARGET >= __MAC_26_0
+    // Mechanism 26. Every disable route passes through here — stop(), setPOWER's off arm, and
+    // setPowerStateOff — which is what makes this the one place the count is complete. It is
+    // also the only thing that clears the HAL's IFF_UP, so it is the sole recovery from a
+    // latched enable failure.
+    gItlwmDisableCalls++;
     // A disable leaves no scan outstanding. Without this the latch survives, and the first
     // SCAN_DONE after the next enable would satisfy a request from the previous session.
     scanCancel();
@@ -2982,6 +3154,14 @@ IOReturn AirportItlwm::registerWithPolicyMaker(IOService *policyMaker)
 void AirportItlwm::setPowerStateOff()
 {
     XYLog("%s\n", __FUNCTION__);
+#if __IO80211_TARGET >= __MAC_26_0
+    // Mechanism 26. A system sleep reaches disableAdapter with no APPLE80211_IOC_POWER involved,
+    // and setPowerStateOn does NOT re-enable — the pair is asymmetric. So an ordinary lid-close
+    // clears the HAL's IFF_UP and is a second, unattended recovery route from a latched stall.
+    // Without this counter that is indistinguishable from an operator's toggle, and every
+    // cumulative counter on a boot that slept is unattributable.
+    gItlwmPmOffCalls++;
+#endif
     pmPowerState = kPowerStateOff;
     disableAdapter(bsdInterface);
     pmPolicyMaker->acknowledgeSetPowerState();

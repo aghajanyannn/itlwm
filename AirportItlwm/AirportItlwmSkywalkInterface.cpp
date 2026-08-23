@@ -1013,8 +1013,36 @@ uint32_t gItlwmLinkIndDown;
 uint32_t gItlwmLinkDownState;
 // The net80211 transition that dropped the link: (ostate << 16) | (nstate << 8) | mgt.
 uint32_t gItlwmLinkDownPair;
-// AirportItlwm::disable() — the non-net80211 route to a link-down. See the call site.
+// Mechanism 26. How many times the adapter was actually disabled, from any of the three call
+// sites (stop(), setPOWER-off, setPowerStateOff). Read against ItlwmSetPowerOff: greater than it
+// means a PM sleep did it and no ioctl was involved.
+//
+// THIS COUNTER READ 0 ON EVERY TARGET FOR ITS WHOLE LIFE BEFORE THIS EDIT. Its only increment
+// sat in AirportItlwm::disable(IO80211SkywalkInterface *), under a `#if __IO80211_TARGET >=
+// __MAC_26_0` nested inside the `#if __IO80211_TARGET < __MAC_26_0` that compiles that whole
+// method out on Tahoe — mutually exclusive conditions, so it compiled on no target at all. It
+// was nevertheless defined, change-guarded, published, and cited as evidence. Any sentence in
+// the DOX resting on a zero reading of it before this edit is void.
+//
+// The general defect is a third variant of the one root AGENTS.md mechanism 9 already records
+// twice: not "published only from a failure path" but "incremented only under an unsatisfiable
+// guard". It is mechanically checkable — every gItlwm* with an increment site must have at
+// least one target on which that site's guard can be true.
 uint32_t gItlwmDisableCalls;
+// Mechanism 26 — the AirportItlwm half of the enable path. The HAL half is in ItlIwx.cpp.
+// SetPowerOn/Off count POWER ioctls that reached setPOWER at all. EnableAdapterCalls counts
+// the ones that got past the isRunning gate, and SetPowerGated counts the ones that did not.
+// The arithmetic is the point: SetPowerOn - EnableAdapterCalls MUST equal SetPowerGated, and
+// a disagreement means the wiring is wrong rather than the driver. PmOffCalls separates a
+// power-management sleep, which reaches disableAdapter with no ioctl at all, from an
+// operator's Wi-Fi toggle — without it an ordinary lid-close is indistinguishable from a
+// recovery toggle and every cumulative reading below is unattributable.
+uint32_t gItlwmSetPowerOn;
+uint32_t gItlwmSetPowerOff;
+uint32_t gItlwmSetPowerGated;
+uint32_t gItlwmEnableAdapterCalls;
+uint32_t gItlwmEnableAdapterRet;
+uint32_t gItlwmPmOffCalls;
 // CoreCapture pipes whose IOService::start ran, and those it failed for. A pipe that never starts
 // has no notify timer, and CCDataPipe::enqueueBlob dereferences that timer unchecked — so
 // Started must equal the number of pipes created, and StartFail must be 0.

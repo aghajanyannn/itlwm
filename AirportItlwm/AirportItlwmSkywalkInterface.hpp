@@ -729,7 +729,14 @@ public:
 #if __IO80211_TARGET < __MAC_26_0
     virtual IOReturn setWCL_SET_MULTI_AP_ENV(apple80211_set_multi_ap_env *) override { return kIOReturnUnsupported; }
 #endif
+    // Mechanism 13. Was an inline stub, which was harmless only while completion was a 100 ms
+    // timer. Now that a completion can be seconds away, an abort must drop our outstanding one.
+    // Declared in BOTH branches of IO80211InfraProtocol.h, so this guard compiles everywhere.
+#if __IO80211_TARGET >= __MAC_26_0
+    virtual IOReturn setWCL_SCAN_ABORT(void *) override;
+#else
     virtual IOReturn setWCL_SCAN_ABORT(void *) override { return kIOReturnUnsupported; }
+#endif
     virtual IOReturn setWCL_REAL_TIME_MODE(apple80211_wcl_real_time_mode *) override { return kIOReturnUnsupported; }
 #if __IO80211_TARGET < __MAC_26_0
     virtual IOReturn setWCL_GARP_MODE(apple80211_wcl_garp_mode *) override { return kIOReturnUnsupported; }
@@ -739,7 +746,21 @@ public:
     // Slot 601. Tahoe's ONLY scan entry point for an infra driver — implemented, not stubbed.
     // See the definition; returning kIOReturnUnsupported here reaches airportd verbatim as
     // 0xe00002c7 and is why no network ever appeared.
+    //
+    // The guard is load-bearing, not tidiness. The definition lives inside
+    // `#if __IO80211_TARGET >= __MAC_26_0`, so declaring this unguarded left
+    // AirportItlwmSkywalkInterface::setWCL_SCAN_REQ an **undefined symbol** in the
+    // Sonoma14.0 and Sonoma14.4 kexts — a vtable slot pointing at nothing, i.e. a kext that
+    // cannot load. It was an inline stub at 53c51c2 and lost its body when Tahoe implemented
+    // it out of line. Caught by `nm -u <kext> | c++filt | grep AirportItlwm`, which must print
+    // NOTHING for every target: an undefined symbol naming one of our OWN classes can never be
+    // satisfied by any kernel collection, so it is always a bug, and the repo's usual
+    // symbol check compares against Apple's collection and so cannot see it.
+#if __IO80211_TARGET >= __MAC_26_0
     virtual IOReturn setWCL_SCAN_REQ(apple80211ScanRequest *) override;
+#else
+    virtual IOReturn setWCL_SCAN_REQ(apple80211ScanRequest *) override { return kIOReturnUnsupported; }
+#endif
 #if __IO80211_TARGET >= __MAC_26_0
     // Slot 602. Tahoe's ONLY association entry point for an infra driver — implemented, not
     // stubbed; see the definition. Tahoe-only for the same reason setCIPHER_KEY's PMK case is:

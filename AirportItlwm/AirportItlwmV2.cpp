@@ -96,6 +96,18 @@ extern uint32_t gItlwmScanReqCalls;
 extern uint32_t gItlwmScanReqStarted;
 extern uint32_t gItlwmScanReqRefused;
 extern uint32_t gItlwmScanBeacons;
+extern uint32_t gItlwmScanDoneEvents;
+extern uint32_t gItlwmScanDoneIgnored;
+extern uint32_t gItlwmScanCompletes;
+extern uint32_t gItlwmScanBackstops;
+extern uint32_t gItlwmScanStray;
+extern uint32_t gItlwmScanReqCoalesced;
+extern uint32_t gItlwmScanReqNoStart;
+extern uint32_t gItlwmScanReqInFlight;
+extern uint32_t gItlwmScanAborts;
+extern uint32_t gItlwmScanReqState;
+extern uint32_t gItlwmScanLastMs;
+extern uint32_t gItlwmScanMaxMs;
 extern uint32_t gItlwmAssocCalls;
 extern uint32_t gItlwmAssocStarted;
 extern uint32_t gItlwmAssocRefused;
@@ -273,6 +285,17 @@ static void publishPreinitMark(IOService *provider, ItlHalService *hal)
 void AirportItlwm::releaseAll()
 {
 #if __IO80211_TARGET >= __MAC_26_0
+    // Take the net80211 hook down FIRST. It is installed in start() and was never cleared;
+    // releaseAll then releases fHalService and scanSource below, and stop() has already NULLed
+    // fNetIf. Adding a SCAN_DONE case makes that teardown window live on every firmware sweep
+    // rather than only on the four RX-path events, so the hook has to go before the objects it
+    // reaches for.
+    if (fHalService != NULL) {
+        struct ieee80211com *ic = fHalService->get80211Controller();
+        if (ic != NULL)
+            ic->ic_event_handler = NULL;
+    }
+    scanCancel();
     // Same contract as IOPCIEDeviceWrapper::fPublishCall, and the same trade for the same
     // reason. thread_call_cancel returns TRUE only when the call was pending and has now been
     // dequeued, so it can never run; it cannot distinguish "idle" from "executing right now".
@@ -343,10 +366,16 @@ void AirportItlwm::
 eventHandler(struct ieee80211com *ic, int msgCode, void *data)
 {
     AirportItlwm *that = OSDynamicCast(AirportItlwm, ic->ic_ac.ac_if.controller);
+    if (that == NULL)
+        return;
     IO80211SkywalkInterface *interface = that->fNetIf;
     if (!interface)
         return;
-    // Reached from the HAL inside iwx_intr, on _fWorkloop's own thread — see postMessageSafe().
+    // Usually reached from the HAL inside iwx_intr, on _fWorkloop's own thread — see
+    // postMessageSafe(). IEEE80211_EVT_SCAN_DONE widens that: ieee80211_end_scan is also reached
+    // from the enable path (iwx_init -> ieee80211_begin_scan -> ieee80211_next_scan) and, on
+    // hal_iwn, inline from iwn_newstate. So every case here must be correct from ANY context —
+    // which is exactly what postMessageSafe provides and an inline postMessage does not.
 #if __IO80211_TARGET >= __MAC_26_0
 #define ITLWM_POST(msg)  that->postMessageSafe((msg), NULL, 0)
 #else
@@ -383,6 +412,18 @@ eventHandler(struct ieee80211com *ic, int msgCode, void *data)
         case IEEE80211_EVT_SCAN_BEACON:
             that->postScanBeacon((const struct ieee80211_beacon_event *)data);
             break;
+        case IEEE80211_EVT_SCAN_DONE:
+            // Mechanism 13. Raised at the TOP of ieee80211_end_scan — before
+            // ieee80211_clean_inactive_nodes, ieee80211_switch_ess and
+            // ieee80211_node_choose_bss — so the node cache is at maximum population at this
+            // instant, the best moment in the cycle to punctuate a scan.
+            //
+            // NEVER call ieee80211_end_scan from this layer. It belongs to ItlIwx::iwx_endscan,
+            // which clears IWX_FLAG_SCANNING *before* calling it; going round that left the
+            // firmware sweeping while net80211 walked to AUTH and every association went out
+            // off-channel.
+            that->scanDoneEvent();
+            break;
 #endif
         default:
             break;
@@ -416,6 +457,7 @@ static uint32_t sLastSkywalkStage, sLastSkywalkTxDequeue, sLastSkywalkRxDequeue;
 // question asked of it — is it *still* posting — without a write per interval.
 static uint32_t sLastLqmPostBucket, sLastLqmBeaconStall;
 static uint32_t sLastScanFailDes, sLastScanFailOr, sLastEssClears, sLastAssocEsslen;
+static uint32_t sLastScanDoneEvents, sLastScanCompletes, sLastScanBackstops, sLastScanLastMs;
 static bool sPublishedOnce;
 
 void AirportItlwm::publishRuntimeCounters()
@@ -451,6 +493,10 @@ void AirportItlwm::publishRuntimeCounters()
         gItlwmScanReqStarted == sLastScanStarted &&
         gItlwmScanReqRefused == sLastScanRefused &&
         gItlwmScanBeacons == sLastScanBeacons &&
+        gItlwmScanDoneEvents == sLastScanDoneEvents &&
+        gItlwmScanCompletes == sLastScanCompletes &&
+        gItlwmScanBackstops == sLastScanBackstops &&
+        gItlwmScanLastMs == sLastScanLastMs &&
         gItlwmAssocCalls == sLastAssocCalls &&
         gItlwmAssocStarted == sLastAssocStarted &&
         gItlwmAssocRefused == sLastAssocRefused &&
@@ -497,6 +543,10 @@ void AirportItlwm::publishRuntimeCounters()
     sLastScanFailDes = fHalService->get80211Controller()->ic_scan_fail_des;
     sLastScanFailOr = fHalService->get80211Controller()->ic_scan_fail_or;
     sLastScanBeacons = gItlwmScanBeacons;
+    sLastScanDoneEvents = gItlwmScanDoneEvents;
+    sLastScanCompletes = gItlwmScanCompletes;
+    sLastScanBackstops = gItlwmScanBackstops;
+    sLastScanLastMs = gItlwmScanLastMs;
     sLastAssocCalls = gItlwmAssocCalls;
     sLastAssocStarted = gItlwmAssocStarted;
     sLastAssocRefused = gItlwmAssocRefused;
@@ -536,6 +586,21 @@ void AirportItlwm::publishRuntimeCounters()
     setProperty("ItlwmScanReqStarted", (UInt64)gItlwmScanReqStarted, 32);
     setProperty("ItlwmScanReqRefused", (UInt64)gItlwmScanReqRefused, 32);
     setProperty("ItlwmScanBeacons", (UInt64)gItlwmScanBeacons, 32);
+    // Mechanism 13. Read Completes against ScanReqCalls, and Backstops against Completes:
+    // Backstops == Completes means the SCAN_DONE path is dead and this is the old timer
+    // behaviour, only slower. LastMs is what retunes kScanBackstopMs.
+    setProperty("ItlwmScanDoneEvents", (UInt64)gItlwmScanDoneEvents, 32);
+    setProperty("ItlwmScanDoneIgnored", (UInt64)gItlwmScanDoneIgnored, 32);
+    setProperty("ItlwmScanCompletes", (UInt64)gItlwmScanCompletes, 32);
+    setProperty("ItlwmScanBackstops", (UInt64)gItlwmScanBackstops, 32);
+    setProperty("ItlwmScanStray", (UInt64)gItlwmScanStray, 32);
+    setProperty("ItlwmScanReqCoalesced", (UInt64)gItlwmScanReqCoalesced, 32);
+    setProperty("ItlwmScanReqNoStart", (UInt64)gItlwmScanReqNoStart, 32);
+    setProperty("ItlwmScanReqInFlight", (UInt64)gItlwmScanReqInFlight, 32);
+    setProperty("ItlwmScanAborts", (UInt64)gItlwmScanAborts, 32);
+    setProperty("ItlwmScanReqState", (UInt64)gItlwmScanReqState, 32);
+    setProperty("ItlwmScanLastMs", (UInt64)gItlwmScanLastMs, 32);
+    setProperty("ItlwmScanMaxMs", (UInt64)gItlwmScanMaxMs, 32);
     setProperty("ItlwmAssocCalls", (UInt64)gItlwmAssocCalls, 32);
     setProperty("ItlwmAssocStarted", (UInt64)gItlwmAssocStarted, 32);
     setProperty("ItlwmAssocRefused", (UInt64)gItlwmAssocRefused, 32);
@@ -1430,11 +1495,92 @@ void AirportItlwm::drainPendingMessages()
 }
 #endif
 
-void AirportItlwm::fakeScanDone(OSObject *owner, IOTimerEventSource *sender)
+#if __IO80211_TARGET >= __MAC_26_0
+// Mechanism 13. The four latch entry points and the ONE place a scan completion is reported.
+//
+// The gate/serialisation argument for all of this is in AirportItlwmV2.hpp beside fScanState;
+// the short form is that scanRequested, scanDoneEvent and fakeScanDone all run under
+// _fWorkloop's gate, while scanAborted/scanCancel may not and so never touch the timer.
+
+void AirportItlwm::scanRequested()
+{
+    uint64_t now;
+
+    // Timestamp BEFORE publishing the latch. The other order lets a SCAN_DONE land in the
+    // window, win the CAS, and compute the elapsed time from the PREVIOUS request — silently
+    // corrupting ItlwmScanLastMs, which is the one number used to retune kScanBackstopMs.
+    clock_get_uptime(&now);
+    absolutetime_to_nanoseconds(now, &now);
+    fScanStartNs = now;
+
+    if (!OSCompareAndSwap(kScanIdle, kScanArmed, &fScanState)) {
+        // WCLScanManager accepts a SCAN_REQ while IN_PROGRESS, queues it, and dequeues one per
+        // SCAN_COMPLETE, re-entering processEvent itself — so a backlog drains at one request
+        // per real sweep with no help from here. Deliberately does NOT re-arm the backstop: a
+        // stream of requests must not be able to postpone it indefinitely.
+        gItlwmScanReqCoalesced++;
+        return;
+    }
+    if (scanSource != NULL) {
+        scanSource->setTimeoutMS(kScanBackstopMs);
+        scanSource->enable();
+    }
+}
+
+void AirportItlwm::scanDoneEvent()
+{
+    gItlwmScanDoneEvents++;
+    if (!OSCompareAndSwap(kScanArmed, kScanIdle, &fScanState)) {
+        gItlwmScanDoneIgnored++;    // nobody asked; see the latch note in the header
+        return;
+    }
+    // Cancelling here is what keeps ItlwmScanStray near zero, and it is safe for the same
+    // reason arming is: this runs on _fWorkloop's own thread with the gate held, the same gate
+    // scanRequested and fakeScanDone hold.
+    if (scanSource != NULL)
+        scanSource->cancelTimeout();
+    scanComplete(false);
+}
+
+void AirportItlwm::scanAborted()
+{
+    gItlwmScanAborts++;
+    // Stop OWNING the scan; do not try to stop the radio. iwx_scan_abort sends a SYNCHRONOUS
+    // host command, and the ioctl path holds the work queue's gate, so the completion interrupt
+    // could not run and it would cost a 1 s tsleep timeout for nothing.
+    scanCancel();
+}
+
+void AirportItlwm::scanCancel()
+{
+    // LATCH ONLY — no timer touch. This can run with no gate held (disableAdapter, releaseAll),
+    // and IOTimerEventSource's calloutGeneration update is a non-atomic read-modify-write that
+    // XNU serialises purely by work-loop-gate convention. A timer left armed is harmless: it
+    // fires, finds the latch clear, and is counted as ItlwmScanStray.
+    OSCompareAndSwap(kScanArmed, kScanIdle, &fScanState);
+}
+
+// The single site that reports a scan completion. Reached from scanDoneEvent (a real firmware
+// sweep ended) and from fakeScanDone (the backstop elapsed). The caller has already won the
+// latch, so exactly one 237+10 pair is posted per accepted request.
+void AirportItlwm::scanComplete(bool backstop)
 {
     UInt32 msg = 0;
-    AirportItlwm *that = (AirportItlwm *)owner;
-#if __IO80211_TARGET >= __MAC_26_0
+    uint64_t now;
+
+    if (backstop)
+        gItlwmScanBackstops++;
+    clock_get_uptime(&now);
+    absolutetime_to_nanoseconds(now, &now);
+    gItlwmScanLastMs = (uint32_t)((now - fScanStartNs) / 1000000ULL);
+    if (gItlwmScanLastMs > gItlwmScanMaxMs)
+        gItlwmScanMaxMs = gItlwmScanLastMs;
+    gItlwmScanCompletes++;
+
+    // Status stays 0 even on the backstop path. WCLScanManager::handleScanComplete counts
+    // consecutive non-zero statuses and fires a CoreCapture trigger at 2. A late scan is not a
+    // failed scan, and an empty result set already says so.
+    //
     // Two messages, because Tahoe has two audiences and only one of them was being told.
     //
     // 237 drives the WCL scan-manager FSM. Without it the FSM sits in
@@ -1449,9 +1595,38 @@ void AirportItlwm::fakeScanDone(OSObject *owner, IOTimerEventSource *sender)
     // Apple splits these across two objects: AppleBCMWLANScanAdapter::scanComplete posts 237,
     // AppleBCMWLANCore::scanComplete posts 10. Both use a 4-byte status and the async flag, and
     // the adapter sends the WCL event first. postMessageSafe preserves order.
-    that->postMessageSafe(APPLE80211_M_WCL_SCAN_COMPLETE, &msg, sizeof(msg));
-    that->postMessageSafe(APPLE80211_M_SCAN_DONE, &msg, sizeof(msg));
+    //
+    // WCLScanManager::scanDoneEventHandler requires a payload of EXACTLY 4 bytes: any other
+    // length is marked handled and silently dropped.
+    //
+    // postMessageSafe, never an inline post: scanDoneEvent reaches here on _fWorkloop's own
+    // thread with the gate held, which is precisely the (inGate=true, onThread=true) state that
+    // panics IO80211Glue::sendIOUCToWcl with "trying to send on thread panic". The deferral ring
+    // is the only construct in this driver that yields (inGate=true, onThread=false).
+    postMessageSafe(APPLE80211_M_WCL_SCAN_COMPLETE, &msg, sizeof(msg));
+    postMessageSafe(APPLE80211_M_SCAN_DONE, &msg, sizeof(msg));
+}
+#endif
+
+void AirportItlwm::fakeScanDone(OSObject *owner, IOTimerEventSource *sender)
+{
+    AirportItlwm *that = (AirportItlwm *)owner;
+#if __IO80211_TARGET >= __MAC_26_0
+    // The BACKSTOP now, not the mechanism — see mechanism 13. Completion normally comes from
+    // IEEE80211_EVT_SCAN_DONE via scanDoneEvent; this fires only when kScanBackstopMs elapsed
+    // with no such event.
+    if (!OSCompareAndSwap(kScanArmed, kScanIdle, &that->fScanState)) {
+        // The latch was already clear: an abort took it, or a real completion beat us and the
+        // cancelTimeout lost a race. Posting anyway would drop a 237 into
+        // SCAN_MANAGER_STATE_IDLE, where the transition table runs handleScanComplete rather
+        // than ignore — a full re-harvest and a spurious userspace SCAN_DONE against a request
+        // that is no longer current.
+        gItlwmScanStray++;
+        return;
+    }
+    that->scanComplete(true);
 #else
+    UInt32 msg = 0;
     that->fNetIf->postMessage(APPLE80211_M_SCAN_DONE, &msg, 4, ITLWM_POSTMSG_ASYNC);
 #endif
 }
@@ -1463,6 +1638,8 @@ bool AirportItlwm::init(OSDictionary *properties)
     awdlSyncEnable = true;
     power_state = 0;
 #if __IO80211_TARGET >= __MAC_26_0
+    fScanState = kScanIdle;
+    fScanStartNs = 0;
     fJoinPending = false;
     fJoinWatchEss = false;
     fJoinMaxState = 0;
@@ -2638,6 +2815,11 @@ void AirportItlwm::disableAdapter(IONetworkInterface *netif)
 {
     watchdogTimer->cancelTimeout();
     watchdogTimer->disable();
+#if __IO80211_TARGET >= __MAC_26_0
+    // A disable leaves no scan outstanding. Without this the latch survives, and the first
+    // SCAN_DONE after the next enable would satisfy a request from the previous session.
+    scanCancel();
+#endif
     fHalService->disable(netif);
 }
 

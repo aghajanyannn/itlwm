@@ -77,6 +77,8 @@ public:
     
     //driver controller
     virtual void clearScanningFlags() override;
+
+    virtual bool isScanning() override;
     
     virtual IOReturn setMulticastList(IOEthernetAddress *addr, int count) override;
     

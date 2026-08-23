@@ -326,6 +326,55 @@ public:
     BssBeaconEntry fBssBeacon[kBssBeaconCacheCount];
     uint64_t       fBssBeaconSeq;
 
+    // --- mechanism 13: scan completion is reported from a real sweep, not a 100 ms timer ---
+    //
+    // IEEE80211_EVT_SCAN_DONE is raised as the FIRST statement of ieee80211_end_scan
+    // (ieee80211_node.c:1513) on every real firmware sweep, with the node cache at maximum
+    // population. scanSource stops being the mechanism and becomes the backstop.
+    //
+    //   kScanIdle  -> kScanArmed   beginScanGated claimed a WCL request
+    //   kScanArmed -> kScanIdle    somebody completed it: scanDoneEvent (the real sweep),
+    //                              fakeScanDone (the backstop), or scanAborted (dropped)
+    //
+    // A latch is REQUIRED, not an optimisation. While disconnected net80211 free-runs full
+    // sweeps forever — end_scan's `notfound` path calls next_scan -> new_state(SCAN), because
+    // IEEE80211_F_AUTO_JOIN with an empty ic_des_essid makes ieee80211_match_bss reject every
+    // candidate — and that loop is what produced ItlwmScanBeacons = 2108 with nothing
+    // outstanding. Reporting each of those sweeps would be the same 10 Hz storm one layer down,
+    // and a 237 arriving in SCAN_MANAGER_STATE_IDLE is NOT ignored: the transition table runs
+    // handleScanComplete there.
+    //
+    // WHY OSCompareAndSwap AND WHY THE TIMER IS SAFE. IOTimerEventSource::wakeAtTime does a
+    // NON-ATOMIC read-modify-write of reserved->calloutGeneration (verified in 25G83:
+    // `movsxd rcx,[r8] / inc rcx / mov [r8],ecx`), and cancelTimeout does the same. XNU
+    // serialises that only by the convention that both are called under the owning work loop's
+    // gate. All three sites that touch scanSource here hold _fWorkloop's gate and are therefore
+    // mutually serialised:
+    //   beginScanGated -> scanRequested   the WCL's thread, via getWorkQueue()->runAction, and
+    //                                     IO80211SkywalkInterface::getWorkQueue() IS _fWorkloop
+    //                                     (interface ivars +0x38, filled from slot 397)
+    //   eventHandler   -> scanDoneEvent   _fWorkloop's own thread, from iwx_intr, gate held
+    //   fakeScanDone                      an IOTimerEventSource ON _fWorkloop
+    // scanAborted/scanCancel may run with no gate at all, so they touch the LATCH ONLY and
+    // never the timer; a stray firing is counted and dropped instead. The CAS is still needed
+    // because the latch itself is read by scanCancel off-gate.
+    enum { kScanIdle = 0, kScanArmed = 1 };
+    volatile UInt32 fScanState;
+    uint64_t        fScanStartNs;
+
+    // A disconnected sweep is forced passive (ic_des_esslen == 0) at ~38 channels x 110 TU,
+    // i.e. order 4 s; a bgscan is slower. WCLScanManager::updateScanTimeout grants 20000 ms, so
+    // 10000 leaves the DRIVER authoring the completion with ~2x margin over the sweep and ~2x
+    // under the family's deadline. RETUNE FROM ItlwmScanLastMs ON BOOT 1 — the 4 s is
+    // arithmetic from firmware constants and has never been measured on this hardware.
+    static const UInt32 kScanBackstopMs = 10000;
+
+    void scanRequested(void);   // beginScanGated, once a request is accepted
+    void scanDoneEvent(void);   // eventHandler, IEEE80211_EVT_SCAN_DONE
+    void scanAborted(void);     // setWCL_SCAN_ABORT
+    void scanCancel(void);      // disableAdapter / releaseAll
+    void scanComplete(bool backstop);   // the single place 237+10 are posted
+
     // fJoinPending is written from the work queue (setWCL_ASSOCIATE), the command gate
     // (setLinkStateGated) and the watchdog work loop, with no lock. The race is benign in both
     // directions: a duplicate completion lands in a state that does not accept it and is dropped,

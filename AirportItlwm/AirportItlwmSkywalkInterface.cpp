@@ -936,6 +936,40 @@ uint32_t gItlwmScanReqRefused;
 // Scan results pushed to IO80211Family as APPLE80211_M_BSS_BEACON. Should climb during a scan;
 // zero while ScanReqStarted climbs means the beacon hook is not firing.
 uint32_t gItlwmScanBeacons;
+// Mechanism 13 — scan completion. Read these together; individually they mislead.
+//   DoneEvents  every IEEE80211_EVT_SCAN_DONE net80211 raised. While disconnected it sweeps
+//               continuously on its own, so this climbs with no request outstanding. Expect it
+//               to be much LARGER than Completes; that is correct, not a leak.
+//   DoneIgnored the subset with no request outstanding — i.e. the 10 Hz storm, suppressed.
+//   Completes   237+10 pairs actually posted. Should track ScanReqCalls closely.
+//   Backstops   completions the TIMER had to author because no SCAN_DONE arrived inside
+//               kScanBackstopMs. MUST BE 0 (or near it) on a healthy boot; if it equals
+//               Completes the event path is dead and this is the old timer behaviour, slower.
+//   Stray       the timer fired with the latch already clear. Small is fine (an abort raced a
+//               pending firing); climbing with Completes means the latch is being lost.
+//   Coalesced   a request arrived while one was outstanding. The WCL queues these itself and
+//               drains one per completion, so a nonzero value is expected under load.
+//   NoStart     accepted in RUN but the HAL reports no sweep in flight — begin_cache_bgscan
+//               declined (already scanning, mgt timer, RSN port not valid). The backstop
+//               answers these; it is the reason Backstops may be nonzero while healthy.
+//   InFlight    the sweep that will complete us had already started when the request arrived.
+//   ReqState    ic_state at the last request (enum ieee80211_state, ieee80211_proto.h:53):
+//               0 = INIT, 1 = SCAN, 2 = AUTH, 3 = ASSOC, 4 = RUN. A boot pinned at 0 with
+//               Refused == Calls is the enable/iwx_init stall, NOT a scan bug — see mechanism 26.
+//   LastMs/MaxMs elapsed request->completion. THIS IS THE NUMBER THAT RETUNES kScanBackstopMs.
+//               Expect order 4000 while disconnected. ~10000 means the backstop authored it.
+uint32_t gItlwmScanDoneEvents;
+uint32_t gItlwmScanDoneIgnored;
+uint32_t gItlwmScanCompletes;
+uint32_t gItlwmScanBackstops;
+uint32_t gItlwmScanStray;
+uint32_t gItlwmScanReqCoalesced;
+uint32_t gItlwmScanReqNoStart;
+uint32_t gItlwmScanReqInFlight;
+uint32_t gItlwmScanAborts;
+uint32_t gItlwmScanReqState;
+uint32_t gItlwmScanLastMs;
+uint32_t gItlwmScanMaxMs;
 // Tahoe association entry point, slot 602 (mechanism 15). Calls climbs as soon as a network is
 // picked in the menu; Refused means net80211 was in no state to start a join. The two Join*
 // counters are the completion messages the WCL's JOIN_MANAGER FSM waits on — a join that reaches
@@ -2249,17 +2283,96 @@ IOReturn AirportItlwmSkywalkInterface::
 beginScanGated(OSObject *target, void *, void *, void *, void *)
 {
     AirportItlwmSkywalkInterface *that = OSDynamicCast(AirportItlwmSkywalkInterface, target);
-    if (that == NULL || that->fHalService == NULL)
+    if (that == NULL || that->fHalService == NULL || that->instance == NULL)
         return kIOReturnNotReady;
     struct ieee80211com *ic = that->fHalService->get80211Controller();
-    if (that->fScanResultWrapping || ic->ic_state <= IEEE80211_S_INIT)
+    ItlDriverController *dc = that->fHalService->getDriverController();
+
+    gItlwmScanReqState = ic->ic_state;
+    if (that->fScanResultWrapping)
         return kIOReturnBusy;
-    ieee80211_begin_cache_bgscan(&ic->ic_ac.ac_if);
-    if (that->scanSource != NULL) {
-        that->scanSource->setTimeoutMS(100);
-        that->scanSource->enable();
+
+    switch (ic->ic_state) {
+    case IEEE80211_S_RUN:
+        // Associated. begin_cache_bgscan is the only entry point that does not disturb the link.
+        // It returns void and declines SILENTLY when IEEE80211_F_BGSCAN is already set, when
+        // ic_mgt_timer != 0, and when the RSN port is not yet valid (ieee80211.c:135-141).
+        //
+        // ACCEPT EITHER WAY — do not turn a decline into a refusal. Today an associated scan
+        // always returns success and completes in 100 ms, so the WCL harvests its beacon cache
+        // even when nothing started; refusing instead would convert a soft failure into a hard
+        // one on the path the machine depends on, including during every 4-way handshake
+        // (ic_mgt_timer != 0). The backstop answers the declined case, and ItlwmScanReqNoStart
+        // names it. The command begin_cache_bgscan issues is ASYNC, so this is safe under the
+        // gate; a synchronous host command here would self-deadlock, because tsleep_nsec sleeps
+        // without releasing the work-loop gate the completion interrupt needs.
+        ieee80211_begin_cache_bgscan(&ic->ic_ac.ac_if);
+        if (dc == NULL || !dc->isScanning())
+            gItlwmScanReqNoStart++;
+        break;
+
+    case IEEE80211_S_SCAN:
+        // Disconnected — the auto-join case. NOTHING IS STARTED HERE, ON PURPOSE.
+        //
+        // begin_cache_bgscan is a hard no-op outside RUN, which is why the old code certified a
+        // scan that had never begun. The fix is NOT to start one: net80211 is already sweeping
+        // continuously without being asked. ieee80211_begin_scan ran once from iwx_init and
+        // every completion re-enters end_scan's `notfound` path, which calls next_scan ->
+        // new_state(SCAN) forever, because IEEE80211_F_AUTO_JOIN with an empty ic_des_essid
+        // makes ieee80211_match_bss reject every candidate. That loop is what produced
+        // ItlwmScanBeacons = 2108 with no request outstanding, and riding it is exactly what
+        // makes the completion honest.
+        //
+        // **DO NOT nudge ieee80211_new_state(ic, IEEE80211_S_SCAN, -1) here.** It looks free and
+        // is not. iwx_newstate exempts SCAN from its same-state guard and writes sc->ns_nstate
+        // and sc->ns_arg UNCONDITIONALLY, then calls iwx_add_task, whose task_add is a no-op
+        // when newstate_task is already queued. So a nudge issued after the join path queued an
+        // AUTH transition — which end_scan does, via ieee80211_node_join_bss, on this same
+        // thread — rewrites ns_nstate from AUTH to SCAN and the authentication is silently
+        // dropped. No ic_state test can see it, because ic_state has not moved yet.
+        break;
+
+    default:
+        // INIT (net80211 never started — a separate bug; one boot measured 502/502 refusals
+        // with 0 beacons) or AUTH/ASSOC (a join is mid-exchange and a sweep would take the
+        // radio off-channel). Refuse.
+        //
+        // A refusal is CLEAN but not free, and the cost is worth stating: it reaches
+        // WCLScanManager::handleScanRequest, which turns a non-zero return into SCAN_REQ_FAILED,
+        // whose handler disassembles to `xor eax,eax; ret` — so the FSM returns to IDLE and NO
+        // scan-complete reaches userspace at all, and airportd's request waits out its own
+        // timeout. That is still better than the false success this used to return, which is
+        // what produced the 10 Hz storm.
+        return kIOReturnBusy;
     }
+
+    if (dc != NULL && dc->isScanning())
+        gItlwmScanReqInFlight++;   // the sweep that will complete us started BEFORE the request
+    // Everything touching scanSource now goes through the CONTROLLER. The interface's own
+    // `scanSource` (set in init) is an unretained alias that releaseAll never NULLs.
+    that->instance->scanRequested();
     return kIOReturnSuccess;
+}
+
+// Ioctl 435, slot 596 — mechanism 13's companion, and NOT optional once completions take
+// seconds. WCLScanManager::abortScan cancels its own scan timer, sends 435, and on a NON-ZERO
+// return immediately synthesises SCAN_COMPLETE(kIOReturnAborted) and drops to IDLE — the fast
+// recovery. On SUCCESS it instead arms a 1000 ms timer and waits for a 237 we would then owe it.
+//
+// THE RETURN VALUE THEREFORE STAYS kIOReturnUnsupported ON PURPOSE. What changes is purely
+// local: drop our own outstanding completion, so that neither the real sweep's SCAN_DONE nor the
+// backstop can post a stale 237 into SCAN_MANAGER_STATE_IDLE — where the transition table runs
+// handleScanComplete rather than ignoring it, costing a full re-harvest and a spurious
+// userspace SCAN_DONE against a request that is no longer current.
+//
+// No runAction wrapper: scanAborted only CASes the latch and never touches the timer, precisely
+// because this can be called without _fWorkloop's gate.
+IOReturn AirportItlwmSkywalkInterface::
+setWCL_SCAN_ABORT(void *)
+{
+    if (instance != NULL)
+        instance->scanAborted();
+    return kIOReturnUnsupported;
 }
 
 IOReturn AirportItlwmSkywalkInterface::

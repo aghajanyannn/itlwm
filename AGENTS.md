@@ -140,6 +140,21 @@ lipo -info build/Release/<Target>/AirportItlwm.kext/Contents/MacOS/AirportItlwm 
     build/Release/<Target>/AirportItlwm.kext/Contents/Info.plist
 ```
 
+**Check every target for undefined symbols naming our OWN classes.** A build that reports SUCCESS
+can still produce a kext that cannot load, and the symbol check in "Surviving a macOS update" runs
+against Tahoe only and compares against *Apple's* collection, so it cannot see this class of fault:
+
+```bash
+for t in itlwm "High Sierra" Mojave Catalina "Big Sur" Monterey Ventura \
+         Sonoma14.0 Sonoma14.4 Tahoe; do
+    K="build/Release/$t/AirportItlwm.kext/Contents/MacOS/AirportItlwm"
+    [ -f "$K" ] && nm -u "$K" | c++filt | grep -H --label="$t" AirportItlwm
+done            # must print NOTHING
+```
+
+A symbol naming one of our own classes can never be satisfied by any kernel collection, so any hit
+is unambiguously a bug. This caught two unloadable Sonoma kexts; see mechanism 25 for the shape.
+
 **Build clean after changing a struct shared between the stack and a HAL**, above all
 `struct ieee80211com`. It is the first member of every `*_softc`, so its size sets every HAL field's
 offset, and an incremental build that reuses one stale object file produces a kext that links,
@@ -496,6 +511,47 @@ with `ScanBeacons = 1283`, i.e. auto-join still never gets a candidate list (mec
 3. ~~Read `ItlwmIctPaddrLo` and `ItlwmPreSleepInitComplete`~~ — **done, both above.** Mechanism 4
    needs a new hypothesis; mechanism 8 is latent, not active.
 4. **Then the functional gaps** — see the ordering note below.
+
+### Where mechanism 13 stands, and what to do next (checkpoint 2026-08-23)
+
+**The cleanup pass is merged** — PR #3 into `olwimo/itlwm:main`, commit `68ed02e`. Working tree
+since then carries only the mechanism 25 fix plus this documentation.
+
+**Landed and verified since the merge, UNBOOTED:**
+
+- **Mechanism 25** — the unguarded `setWCL_SCAN_REQ` declaration that made both Sonoma kexts
+  unloadable. One header edit; all nine AirportItlwm targets rebuild with zero own-class undefined
+  symbols. This is a genuine shipping-breakage fix and is independent of everything below.
+
+**MECHANISM 13 IS IMPLEMENTED, BOOTED AND MEASURED WORKING.** Auto-join succeeded unaided on a
+machine that had never auto-joined once; full numbers and the exact counter reconciliation are in
+mechanism 13's entry. Verified before boot: clean build of all ten targets, 0 own-class undefined
+symbols on every target, 0 unresolved against the running 25G83 (952 undefined, +1 =
+`OSCompareAndSwap`), `mapdrv` 211 + 45 correct / 0 wrong, `callcheck` 94 slots / 0 wrong.
+
+**Two entries changed status as a result, both in the same direction — a claimed blocker that
+was not one:**
+
+- **Mechanism 24 is REFUTED and demoted.** Auto-join works with message 55 never sent.
+- **Mechanism 26 is new**: the `IEEE80211_S_INIT` boot race, which is pre-existing (confirmed by
+  boot comparison against the old kext) and is what made two boots unmeasurable. One Wi-Fi power
+  toggle recovers it.
+
+**Next steps, in order:**
+
+1. **Commit mechanism 13** — the working tree carries it plus mechanism 25 plus this
+   documentation, and nothing is committed yet.
+2. **Mechanism 26**, because it is now the top user-visible defect: a boot that comes up with no
+   Wi-Fi until you toggle it. Add `ItlwmEnableCalls`/`ItlwmEnableRet` first — the stall is
+   currently indistinguishable from "enable never called", and one boot with those two counters
+   settles which.
+3. **Then the remaining functional gaps**: 20 (LQM rate group — cheapest, the driver already has
+   the number), 17 (`networksetup` association report), 18 (roaming), 22 (Private Wi-Fi Address =
+   Off). Mechanism 14 (scan request parameters) is now unblocked, since completion finally
+   corresponds to a real sweep.
+
+**Whenever a boot shows `ItlwmScanReqState = 0` with `Refused == Calls`, stop and read mechanism
+26 before concluding anything about scanning.** That state can measure nothing about the scan path.
 
 ### Deliberately NOT removed, so it is not re-proposed
 
@@ -1983,18 +2039,172 @@ every `ITLWM_*_OFFSET`, and every `Itlwm*` counter.
     filled, the WCL immediately re-requests, and auto-join never gets a candidate list. A manual
     join works first time from the same state, which is what isolates this to scan *reporting*
     rather than scan or association.
-    **That makes this the highest-value open stopgap for a user, not a latent one** — it is the
-    difference between Wi-Fi that connects itself and Wi-Fi you have to join by hand.
- `AirportItlwmSkywalkInterface::beginScanGated`
+    `AirportItlwmSkywalkInterface::beginScanGated`
     starts a net80211 background scan, arms `scanSource` for 100 ms, and then reports the scan
-    complete regardless of what the scan is doing. So a "scan" is really "wait 100 ms, then report
-    whatever the node cache already held". Inherited from the pre-Tahoe `setSCAN_REQ`, not
-    introduced for Tahoe. **A timer is a race**, the same shape as 7. *Real fix:* net80211 already
-    raises `IEEE80211_EVT_SCAN_DONE` (`ieee80211_node.c:1407`) and the V1 path in
-    `AirportSTAIOCTL.cpp` already handles it — the V2 `eventHandler` simply does not, so the event
-    exists and is being ignored. Drive completion off it. **Done when** no `setTimeoutMS(100)`
-    remains on the scan path. It blocks 14: channel subsets and dwell times have nothing to act on
-    while completion is unrelated to the scan. → `AirportItlwm/AGENTS.md`
+    complete regardless of what the scan is doing. Inherited from the pre-Tahoe `setSCAN_REQ`, not
+    introduced for Tahoe. **A timer is a race**, the same shape as 7.
+
+    **INVESTIGATED, NOT YET IMPLEMENTED (2026-08-23).** A six-reader investigation settled the
+    mechanism exactly and overturned three claims this entry used to make. Nothing below is
+    written to code yet except the Sonoma load-failure fix, which is separate and landed.
+
+    **Two corrections to what this entry said.**
+    - **"The V1 path already handles it" is FALSE.** `AirportSTAIOCTL.cpp:1209`'s
+      `IEEE80211_EVT_SCAN_DONE` case is inside `#if 0` and has been since the commit that wrote it
+      (`48a1fe5`, April 2021, upstream). It has never run. There is no prior art in this repo, and
+      no recorded reason it was disabled.
+    - The raise site is `ieee80211_node.c:1514`, not 1407.
+
+    **The root cause is TWO defects, and the timer is the lesser one.**
+    1. **`ieee80211_begin_cache_bgscan` is a no-op when disconnected.** It returns immediately
+       unless `ic_state == IEEE80211_S_RUN` (`ieee80211.c:136`). Auto-join happens precisely when
+       *not* associated, so the WCL's scan request starts nothing whatsoever, and the 100 ms timer
+       then reports completion of a scan that never began.
+    2. **The 100 ms window is ~40x too short even when a scan does run.** A real iwx sweep is
+       **~4 s** (≈38 channels × 110 TU passive dwell, forced passive because `ic_des_esslen == 0`).
+
+    **Why the beacons do not help — and this is WEAKER than it first looked, so read the caveat.**
+    `WCLScanRequest::getScanResultsFromStore` copies only beacons whose
+    `getTimestamp() >= scanRequest.getMinTimestamp()` (`apple80211_scan_data + **0x1598**`), and
+    harvests **once**, inside `WCLScanManager::enqueueCompleteScanRequest` when 237 arrives, after
+    reaping everything older than 30 s. The scan request carries an age floor, so only beacons
+    landing inside *that request's own window* are counted.
+
+    **The caveat, and it undercuts the obvious conclusion.**
+    `findfield.py com.apple.iokit.IO80211Family 1598` reports **2 accesses, 0 writes** — *no kernel
+    code anywhere in IO80211Family derives that floor from the scan's start time.* It is copied
+    verbatim out of the `apple80211_scan_data` **airportd** hands in. So "widen the completion
+    window and `scanResultsCount` rises" is contingent entirely on what userspace puts in that
+    field, and **cannot be verified from the kernel at all**. The plausible bad outcome is
+    `ItlwmScanLastMs` climbing to seconds with `scanResultsCount` unchanged. Treat the causal chain
+    as unproven until a boot shows both moving together.
+    **Rule: a field the family only ever READS is a userspace decision wearing a kernel offset.**
+    Two accesses and zero writes is the tell, and it costs one `findfield.py` to check.
+
+    **The completion signal already exists and is simply discarded.** `IWX_SCAN_COMPLETE_UMAC` →
+    `iwx_endscan` → `ieee80211_end_scan` → `IEEE80211_EVT_SCAN_DONE`, on every real firmware sweep,
+    for all three HALs. **No `itl80211/` change is needed at all** — the event is raised as the
+    *first* statement of `ieee80211_end_scan`, i.e. with the node cache at maximum population,
+    before `ieee80211_clean_inactive_nodes` prunes it. That raise site is therefore load-bearing
+    and must stay at the top of the function.
+
+    **The WCL already owns the backstop, so the driver needs no long timer of its own.**
+    `WCLScanManager::updateScanTimeout` arms `IO80211TimerSource "WCLScanManager::timeoutScan"` at
+    **20 000 ms**, cancelled by `sendScanCompleteEvent`. Message 237 must carry exactly a **4-byte
+    status** and it must be **0** — `scanDoneEventHandler` silently drops any other length.
+
+    **The threading is the sharp edge and it is confirmed dangerous.** `ieee80211_end_scan` on iwx
+    runs on `_fWorkloop`'s own thread **with the gate held** — `inGate() == true`,
+    `onThread() == true` — which is exactly the state that panics `IO80211Glue::sendIOUCToWcl`
+    ("trying to send on thread panic"). **Posting 237 inline from the event handler panics on the
+    first scan.** The existing `postMessageSafe` deferral ring is the only construct that yields
+    `(inGate=true, onThread=false)` from any raising thread, and the current timer path already
+    uses it, so routing SCAN_DONE through it adds no new context.
+
+    **A correlation latch is required, not optional.** While disconnected net80211 free-runs full
+    sweeps forever on its own — `iwx_init` calls `ieee80211_begin_scan`, `ieee80211_match_bss`
+    rejects every candidate because `IEEE80211_F_AUTO_JOIN` is set with `ic_des_esslen == 0`, and
+    `end_scan`'s `notfound:` path loops straight back into `iwx_scan`. That loop is what produced
+    `ItlwmScanBeacons = 2108`. Without a latch correlating a completion to an outstanding WCL
+    request, those unrequested sweeps would drive the FSM exactly as the 100 ms timer does now.
+
+    **`setWCL_SCAN_ABORT` (596) must be implemented in the same change**, not deferred: once
+    completions take seconds, the WCL's abort path self-completes at ~1 s and a later real
+    SCAN_DONE lands as a stray 237 in `SCAN_MANAGER_STATE_IDLE`, which `handleScanComplete` acts
+    on rather than ignores.
+
+    **The shape all three independent designs converged on**, for whoever implements it:
+    demote `scanSource` to a backstop at 5–10 s (inside the WCL's 20 s budget) and drive completion
+    from `IEEE80211_EVT_SCAN_DONE`; add a latch so exactly one 237+10 pair is posted per request;
+    implement 596. **The SCAN_DONE handler must never post — it only pulls the existing timer
+    forward**, so 237/10 keep leaving from `fakeScanDone`, the one context already proven safe.
+    All Tahoe-guarded; no `include/Airport/` change, no vtable change, no `ieee80211com` field.
+    Do **not** nudge `ieee80211_new_state(ic, IEEE80211_S_SCAN, -1)` from the scan path: when
+    disconnected net80211 is already sweeping continuously, and `iwx_newstate_task` writes
+    `ns_nstate`/`ns_arg` unconditionally while `iwx_add_task` dedups, so a nudge can convert a
+    queued AUTH into a SCAN.
+
+    **FOUR DEFECTS THE ADVERSARIAL PASS FOUND IN THAT PLAN. Fix all four before building.**
+
+    1. **`IOTimerEventSource` arming is NOT safe from arbitrary contexts, and believing it was is
+       the worst bug in the plan.** `IOTimerEventSource::wakeAtTime` on 25G83 ends with
+       `movsxd rcx,[r8] / inc rcx / mov [r8],ecx` — a **non-atomic read-modify-write** of
+       `reserved->calloutGeneration`, and `cancelTimeout` does the same with `inc dword [rax]`.
+       XNU serialises this only by the convention that both are called **under the owning work
+       loop's gate**. A design with three writers on unrelated gates (request on the WCL's gate,
+       SCAN_DONE on `_fWorkloop`'s, cancel on none) drops a firing when a racing `inc` lands
+       between another writer's read and store. A CAS latch does **not** help — it decides who may
+       *try*, not who is serialised. With no watchdog the latch then sticks and **scanning dies
+       until disable/enable, with `ItlwmScanBackstops = 0` reading as healthy.**
+       *Fix:* route every touch of the timer through one gate, **or** have the existing 1 Hz
+       watchdog re-arm whenever the latch is non-idle and older than the backstop.
+       **Rule: "this API is safe from any context" is a claim to disassemble, not assume.** An
+       IOKit setter can be lock-free and still require a specific gate by convention.
+    2. **Order the timestamp store before the CAS.** Storing `fScanStartNs` after publishing the
+       latch lets a SCAN_DONE land in the window and compute the elapsed time from the *previous*
+       request — silently corrupting the one number used to retune the backstop. (Two lenses found
+       this independently; one also notes the mirror case, where arming after the CAS re-arms a
+       timer another thread already pulled to 0, giving a 10 s late completion that no counter
+       names.)
+    3. **Do not hard-refuse in `RUN`.** Today an associated scan always succeeds and completes in
+       100 ms, so the WCL harvests the cache even when `ieee80211_begin_cache_bgscan` declines.
+       Refusing instead converts a soft failure into a hard one on the path the machine depends on,
+       for no benefit — and `ieee80211_end_scan`'s empty-cache path returns without clearing
+       `IEEE80211_F_BGSCAN`, so the refusal can persist. Accept and let the backstop answer; keep
+       the hard refusal for `INIT`/`AUTH`/`ASSOC` only. Note that refusing during `AUTH`/`ASSOC`
+       still costs every scan issued *during a join*, because `SCAN_REQ_FAILED`'s handler is a bare
+       stub — **no scan-complete reaches userspace at all**, so airportd's request hangs to its own
+       timeout. That cost is acceptable but must be stated, not discovered.
+    4. **`fScanState`/`fScanStartNs` must be initialised explicitly** in `AirportItlwm::init`
+       beside `fJoinPending`. Relying on IOKit zeroing allocations works and breaks this file's own
+       convention.
+
+    **IMPLEMENTED, BOOTED AND MEASURED WORKING — 2026-08-23, build `0FF0FEBA`, 26.6.2 (25G83).**
+    Auto-join succeeded with no user action, on a machine that had never auto-joined once:
+
+    ```text
+    AUTO-JOIN: Join SUCCEEDED (duration=5095ms, error=((null)))
+    AUTO-JOIN: Auto-join COMPLETED (result=1, error=((null)), scanChannelCount=38)
+    AUTO-JOIN: Updated join status (... auto=yes ...)   candidateBSSCount=2  candidateSSIDCount=1
+    en3  inet 192.168.87.154  status: active
+    ```
+
+    Driver-side accounting, and it reconciles exactly — which is the evidence the latch is right:
+
+    ```text
+    ScanReqStarted 7  −  ScanAborts 1        = 6 completions owed
+    ScanDoneEvents 5  −  ScanDoneIgnored 1   = 4 from real firmware sweeps
+                             + ScanBackstops 2 = 6 = ScanCompletes          ✓
+    ScanStray 0   ScanReqCoalesced 0   ScanReqNoStart 0
+    ScanLastMs 378   ScanMaxMs 10001 (= kScanBackstopMs exactly)
+    AssocCalls 1  JoinAssocDone 1  JoinConnectDone 1  JoinTimeouts 0  LinkIndUp 1  LqmPosts 19
+    ```
+
+    - **`scanResultsCount` is consistently non-zero** (9–37) where it was 0 on 38 of 52 samples.
+    - **The 10 Hz storm is gone**: SCAN_MANAGER fell to ~1 cycle per 7 s, and once associated
+      airportd stops requesting altogether (`ScanReqCalls` static).
+    - **`ScanDoneIgnored = 1`** is the latch suppressing an uncorrelated free-running sweep — the
+      thing that would have reproduced the storm one layer down.
+    - **The backstop is load-bearing, not decoration**: 2 of 6 completions came from it, one at
+      exactly 10001 ms. Do not delete it, and do not shorten it below a real sweep.
+
+    **MECHANISM 24 WAS NOT NEEDED, AND ITS PREMISE IS REFUTED BY THIS BOOT.** This entry used to
+    say "fixing this will not, on its own, fix auto-join — see mechanism 24", on the grounds that
+    `airportd` refuses to start auto-join until driver message 55 sets the driver-available bit.
+    Auto-join started and succeeded here with **message 55 never sent**. The adversarial review had
+    flagged exactly this ("Part B's causal chain is contradicted by the project's own record") and
+    it was right. Fixing the candidate list was sufficient; the earlier `driver not available`
+    aborts were a different phase (they coincide with `AutoJoin: no user logged in`).
+    **Rule: a gate observed shut alongside a failure is not shown to be the cause of it.** Two
+    boots with the same bit value produced opposite auto-join outcomes, which was on the page
+    before mechanism 24 was written and should have blocked writing it that way.
+
+    **Done when** completion is reported from `IEEE80211_EVT_SCAN_DONE` with the timer demoted to a
+    backstop, and a boot shows `scanResultsCount` consistently non-zero with the SCAN_MANAGER
+    cadence down from ~10 Hz to roughly one cycle per sweep. Note the old Done-when — "no
+    `setTimeoutMS(100)` remains" — is superseded: the timer is retained deliberately, at a longer
+    period. It blocks 14: channel subsets and dwell times have nothing to act on while completion
+    is unrelated to the scan. → `AirportItlwm/AGENTS.md`
 
 14. **The scan request's parameters are ignored.** `setWCL_SCAN_REQ` discards the
     `apple80211ScanRequest` whole: no channel subset, no SSID filter — so no hidden networks — and
@@ -2604,6 +2814,145 @@ every `ITLWM_*_OFFSET`, and every `Itlwm*` counter.
     **Done when** a rotation on a live connection either completes a re-association, or is measured
     never to occur and this entry is deleted with that measurement recorded.
     → `AirportItlwm/AGENTS.md`, `itl80211/AGENTS.md`
+
+24. **REFUTED AND DEMOTED — do not build this.** Auto-join now works with message 55 never sent
+    (see mechanism 13's measured result, 2026-08-23). This entry claimed that `airportd` refuses to
+    START auto-join until driver message 55 sets the driver-available bit, and that mechanism 13
+    was therefore necessary but not sufficient. **Both halves were wrong**, and the adversarial
+    review said so before the boot: the kernel half (message 55 sets `[monitor+0x10]->byte[0xae8]`)
+    is real, but that `airportd`'s `__allowAutoJoinWithTrigger:` *acts on* that bit was never
+    established, and mechanism 22 already recorded two boots with the same bit value and opposite
+    outcomes. The `driver not available` aborts that motivated this entry coincide with
+    `AutoJoin: no user logged in`, i.e. a login-phase effect, not a driver-availability gate.
+    Retained only so the reasoning is not repeated. The 0xB8-vs-0xF8 struct-size finding below is
+    still *correct as a fact* and worth keeping if message 55 is ever wanted for another reason;
+    the unguarded reporter deref makes posting it a real risk with no known payoff.
+    **Rule: a gate observed shut alongside a failure is not shown to be the cause of it.**
+    Original text follows.
+
+    **`airportd` refuses to START auto-join because the driver never claims to be available.**
+
+    **The evidence is a boot on which everything else worked.** On the 23:33–23:58 session the
+    driver was fully functional — 83 scan completions, `scanResultsCount` up to 35, two successful
+    manual joins — and across that entire boot `airportd` logged **53 × `Auto-join aborted …
+    error=(37 'driver not available')` and 0 × `Auto-join STARTED`**. So auto-join was never
+    attempted, on results that were present. A good candidate list is necessary and not sufficient.
+
+    The gate is `-[CWXPCInterfaceContext __allowAutoJoinWithTrigger:reply:]` in `airportd`, and the
+    kernel bit behind it is set only by driver message **55** (`APPLE80211_M_DRIVER_AVAILABLE`),
+    which this driver has never sent.
+
+    **The reason it would be dropped even if sent is a size mismatch in our own header.**
+    `include/Airport/apple80211_ioctl.h` declares `apple80211_driver_available_data` with a
+    `static_assert` at **0xB8**. Tahoe requires **0xF8**:
+    `IO80211ControllerMonitor::setDriverAvailable` opens `cmp rdx, 0xf8 / jne bail`, and
+    `WCLSystemStateManager::driverAvailableEventHandler` requires `cmp qword [r15+8], 0xf8`. A 0xB8
+    payload is **discarded in silence** — the `BeaconMetaData` bit-14 shape again, at struct scale.
+    The field offsets our header already carries are correct against the disassembly
+    (`dword [r14+8]` availability, `[rax+0x10]` reason, `[rax+0x14]` subReason); only the total size
+    is wrong, so the fix is padding, not a re-derivation.
+
+    **This resolves mechanism 22's `isDriverAvailable=<0>` "dead end", which was mis-attributed.**
+    That entry records the bit as a dead end because it read 0 on a fully working connection, and
+    blames `enable()` never running. Both halves were wrong: it reads 0 because message 55 is never
+    sent, and it is genuinely load-bearing — for *auto-join only*, which is why a manual join
+    succeeds beside it. Manual association never passes through that gate. **Rule: a flag that
+    discriminates nothing between two cases you tested may still gate a third case you did not.**
+
+    *Real fix:* size the struct at 0xF8 (Tahoe-guarded, padding only — it is a payload type, in no
+    vtable, so no slot moves) and post message 55 from `enableAdapter` once `fHalService->enable()`
+    succeeds. Counter `ItlwmDriverAvailPosts`, published in the same edit.
+
+    **TWO WARNINGS, AND THE FIRST MEANS THIS ENTRY IS NOT YET ENTITLED TO CALL ITSELF THE FIX.**
+
+    - **The kernel half is verified; the userspace half is NOT, and this repo's own record argues
+      against it.** That message 55 sets `[monitor+0x10]->byte[0xae8]` is proven. That airportd's
+      `__allowAutoJoinWithTrigger:` *consults* that bit is **assumed**. Mechanism 22 records
+      `isDriverAvailable=<0>` measured on a fully working, associated connection and concludes "it
+      discriminates nothing" — and two boots with the same bit value produced 53 aborts and 0
+      aborts. So setting the bit could well change nothing. Worse, the obvious success criterion
+      (`isDriverAvailable=<1>`) is satisfied *by construction* the moment 55 is posted, so this
+      change **can pass its own check while auto-join stays exactly as broken**.
+      *Establish the reader first*: one `log stream` on `__allowAutoJoinWithTrigger` across a boot
+      where the bit reads 1. Until then do not describe this as the half that unblocks auto-join.
+      **Rule: when a fix's success criterion is the thing the fix mechanically sets, it is not a
+      criterion.** Name an outcome downstream of the consumer — here `Auto-join STARTED`.
+    - **`setDriverAvailable` dereferences reporter pointers with no NULL check** —
+      `mov rdi,[rax+0x518]` into `IOSimpleReporter::incrementValue`, and
+      `IO80211ControllerMonitor::destroyReporters` exists, so they are not unconditionally present.
+      Nothing has ever exercised this path for this driver, and **passing the correct 0xF8 length
+      is exactly what takes the deref instead of the `cmp rdx,0xf8` bail.** Confirm the reporters
+      exist via IOReporting on the `AirportItlwm` node — `configureReport`/`updateReport` reach the
+      same objects, so `ioreg` answers it without a boot — or ship mechanism 13 alone first.
+
+    **Done when** a boot logs `Auto-join STARTED` at least once, and joins a known network with no
+    user action. → `AirportItlwm/AGENTS.md`
+
+25. **REGRESSION WE INTRODUCED, FOUND AND FIXED: `AirportItlwm-Sonoma14.0` and
+    `AirportItlwm-Sonoma14.4` could not load.** Recorded because the *detection method* is the
+    durable part, not the one-line fix.
+
+    `AirportItlwmSkywalkInterface::setWCL_SCAN_REQ` was an inline stub returning
+    `kIOReturnUnsupported` at `53c51c2`. The Tahoe work (`6d159ef`) implemented it out of line
+    inside `#if __IO80211_TARGET >= __MAC_26_0` but left the *declaration* unguarded, so both
+    Sonoma targets kept a vtable slot pointing at a symbol with no definition anywhere. Fixed by
+    giving the declaration the same `#if/#else` shape `setWCL_ASSOCIATE` directly below it already
+    had. All nine AirportItlwm targets rebuild clean with zero own-class undefined symbols.
+
+    **The repo's standing symbol check could not see this, and that is the lesson.** Step 6 of
+    "Surviving a macOS update" compares a kext's undefined symbols against *Apple's* collection —
+    it answers "does the kernel supply what we import". An undefined symbol naming one of **our
+    own** classes can never be supplied by any collection, so it is always a bug, and it is
+    invisible to that check. It is also invisible to the build, which reports SUCCESS. Add to the
+    verification routine, for **every** target rather than just Tahoe:
+
+    ```sh
+    nm -u build/Release/<Target>/AirportItlwm.kext/Contents/MacOS/AirportItlwm \
+        | c++filt | grep AirportItlwm      # must print NOTHING
+    ```
+
+    **Rule: an out-of-line definition behind a `#if` needs the declaration behind the same `#if`.**
+    Moving a stub's body out of the header to implement it for one release silently removes it from
+    every other release that builds the same file. The pre-Tahoe targets are not covered by the
+    Tahoe symbol check, so nothing else would have caught it.
+
+26. **INTERMITTENT BOOT RACE: net80211 never leaves `IEEE80211_S_INIT`, so the radio never comes
+    up.** Newly separated out, because it masqueraded as a scan bug twice and cost a measurement
+    cycle each time.
+
+    Signature, all readable in one `ioreg`:
+
+    ```text
+    ItlwmScanReqState = 0        (IEEE80211_S_INIT)   ItlwmScanBeacons = 0
+    ItlwmScanReqRefused == ItlwmScanReqCalls          ItlwmScanReqStarted = 0
+    ItlwmInitMark = 7, ItlwmInitErr = 0, ItlwmInitComplete = 1     <- attach-time init ucode is FINE
+    ItlwmSkywalkStage = 11, QueuesEnabled = 4, RxFree = 255        <- the data path is FINE
+    en3 UP,RUNNING but `status: inactive`;  Country Code: ZZ, Locale: Unknown
+    networksetup -getairportpower en3 -> On;  IOC_POWER Set returns GOOD
+    ```
+
+    So the kext loads, registers, builds the Skywalk data path and answers ioctls, and the *radio*
+    is simply never brought up: `enable()` / `iwx_init` does not complete, `ic_state` stays 0, and
+    `beginScanGated` correctly refuses every scan. **`Country Code: ZZ` is the fastest tell** — a
+    working boot reports `DE/ETSI` with 38 channels.
+
+    **It is a race, not a hard fault, and the recovery is one command:** toggling Wi-Fi off and on
+    (`sudo networksetup -setairportpower en3 off; ... on`, or the menu bar) re-runs `enableAdapter`
+    → `iwx_init` and the driver comes fully to life — measured 2026-08-23, after which the same
+    boot scanned, auto-joined and held a DHCP lease.
+
+    **PRE-EXISTING, NOT CAUSED BY MECHANISM 13.** Confirmed by boot comparison: the 01:05:44 boot
+    ran the *pre*-mechanism-13 kext and shows the identical signature (`scanResultsCount=0`, the
+    SCAN_MANAGER cycling through `SCAN_REQ_FAILED`), while the 23:33 boot on the same build worked
+    normally. Do not attribute it to whatever change is newest.
+
+    *Where to look:* `AirportItlwm::enableAdapter` → `fHalService->enable()` → `iwx_activate`/
+    `iwx_init`, and what `setPOWER` does when it arrives before the interface is ready. Note
+    `ItlwmDisableCalls = 0` on a stalled boot, so nothing disabled it afterwards — the enable
+    either never ran or returned without starting the radio. **There is no counter for it**, which
+    is the first thing to fix: an `ItlwmEnableCalls`/`ItlwmEnableRet` pair would distinguish "never
+    called" from "called and failed" in one boot, and neither is currently distinguishable.
+    **Done when** ten consecutive boots reach `ItlwmScanReqState != 0` without a power toggle.
 
 ## DOX framework
 

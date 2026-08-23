@@ -140,6 +140,15 @@ clearScanningFlags()
     com.sc_flags &= ~(IWM_FLAG_SCANNING | IWM_FLAG_BGSCAN);
 }
 
+// Mechanism 13. The complement of clearScanningFlags above: true exactly while one of the two
+// flags it clears is set, i.e. between the scan command and the completion notification that
+// reaches ieee80211_end_scan. Instrumentation only — see ItlDriverController.hpp.
+bool ItlIwm::
+isScanning()
+{
+    return (com.sc_flags & (IWM_FLAG_SCANNING | IWM_FLAG_BGSCAN)) != 0;
+}
+
 IOReturn ItlIwm::
 setMulticastList(IOEthernetAddress *addr, int count)
 {

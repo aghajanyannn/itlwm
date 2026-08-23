@@ -276,11 +276,38 @@ uint32_t gItlwmWaitExitState;
 uint32_t gItlwmScanStateWakes;
 uint32_t gItlwmRadioSleeps;
 uint32_t gItlwmIwxStopCalls;
+// Mechanism 26, second round. RadioMark0 = 8 named iwx_init_hw and stopped there; these split
+// it. All are PER-ATTEMPT — reset at iwx_init_hw entry — which is the whole point:
+// ItlwmPreinitMark and ItlwmInitMark are cumulative and are rewritten by BOTH the attach-time
+// and the enable-time call, so a value that also occurs at attach cannot be attributed to
+// either. Reading them as enable-path values produced two wrong localisations in one sitting.
+// A per-attempt counter reading 0 means "this did not run on this attempt", full stop.
+uint32_t gItlwmHwMark;
+uint32_t gItlwmUcodeMark;
+int gItlwmUcodeErr;
+uint32_t gItlwmAliveMark;
+// Kicks is cumulative; KicksAtHw is latched at iwx_init_hw entry. The difference is how many
+// host commands actually went out on this attempt, which is what separates a wait that expired
+// on a command from one that expired on a bare firmware notification. LastCode is the wide id
+// of the last command kicked: (group << 8) | opcode.
+uint32_t gItlwmCmdKicks;
+uint32_t gItlwmCmdKicksAtHw;
+uint32_t gItlwmCmdLastCode;
 }
 #define ITLWM_PREINIT_MARK(n, e) \
     do { gItlwmPreinitMark = (n); gItlwmPreinitErr = (e); } while (0)
 #define ITLWM_INIT_MARK(n, e) \
-    do { gItlwmInitMark = (n); gItlwmInitErr = (e); } while (0)
+    do { gItlwmInitMark = (n); gItlwmInitErr = (e); \
+         gItlwmUcodeMark = (n); gItlwmUcodeErr = (e); } while (0)
+// Step ordinals inside iwx_init_hw and iwx_load_ucode_wait_alive. They carry no errno of their
+// own: the value iwx_init_hw returns is already latched as ItlwmRadioErr0 by the mark-8 site.
+// Placed BEFORE each call and never in front of a return, so no unbraced `if` can capture one.
+#define ITLWM_HW_MARK(n)    do { gItlwmHwMark = (n); } while (0)
+#define ITLWM_ALIVE_MARK(n) do { gItlwmAliveMark = (n); } while (0)
+#define ITLWM_HW_RESET()    do { \
+    gItlwmHwMark = 0; gItlwmUcodeMark = 0; gItlwmUcodeErr = 0; gItlwmAliveMark = 0; \
+    gItlwmCmdKicksAtHw = gItlwmCmdKicks; \
+} while (0)
 #define ITLWM_PRESLEEP_SNAP(sc) \
     do { gItlwmPreSleepInitComplete = (uint32_t)(sc)->sc_init_complete; } while (0)
 // A mark is TERMINAL when no further mark can follow it within the same enable attempt.
@@ -308,7 +335,9 @@ uint32_t gItlwmIwxStopCalls;
 // definition is inside — is mechanism 25's exact shape. Route it through ITLWM_CNT/ITLWM_SET.
 #define ITLWM_CNT(v)     do { (v)++; } while (0)
 #define ITLWM_SET(v, x)  do { (v) = (x); } while (0)
-#define ITLWM_CMD_KICK(ring) do { \
+#define ITLWM_CMD_KICK(ring, code) do { \
+    gItlwmCmdKicks++; \
+    gItlwmCmdLastCode = (uint32_t)(code); \
     gItlwmCmdQid = (uint32_t)(ring)->qid; \
     gItlwmCmdDoorbell = (uint32_t)((ring)->qid << 16 | (ring)->cur); \
     gItlwmIsrAtKick = gItlwmIsrCount; \
@@ -359,12 +388,15 @@ uint32_t gItlwmIwxStopCalls;
 #else
 #define ITLWM_PREINIT_MARK(n, e) do { } while (0)
 #define ITLWM_INIT_MARK(n, e) do { } while (0)
+#define ITLWM_HW_MARK(n) do { } while (0)
+#define ITLWM_ALIVE_MARK(n) do { } while (0)
+#define ITLWM_HW_RESET() do { } while (0)
 #define ITLWM_PRESLEEP_SNAP(sc) do { } while (0)
 #define ITLWM_RADIO_MARK(n, e) do { } while (0)
 #define ITLWM_CNT(v) do { } while (0)
 #define ITLWM_SET(v, x) do { } while (0)
 #define ITLWM_PREINIT_SNAP(sc) do { } while (0)
-#define ITLWM_CMD_KICK(ring) do { } while (0)
+#define ITLWM_CMD_KICK(ring, code) do { } while (0)
 #define ITLWM_CMD_DONE(qid, code) do { } while (0)
 #define ITLWM_NOTIF_INTR() do { } while (0)
 #define ITLWM_ISR() do { } while (0)
@@ -5095,14 +5127,17 @@ iwx_load_ucode_wait_alive(struct iwx_softc *sc)
     XYLog("%s\n", __FUNCTION__);
     int err;
     
+    ITLWM_ALIVE_MARK(1);
     err = iwx_read_firmware(sc);
     if (err)
         return err;
     
+    ITLWM_ALIVE_MARK(2);
     err = iwx_start_fw(sc);
     if (err)
         return err;
     
+    ITLWM_ALIVE_MARK(3);
     err = iwx_load_pnvm(sc);
     if (err)
         return err;
@@ -6721,7 +6756,7 @@ iwx_send_cmd(struct iwx_softc *sc, struct iwx_host_cmd *hcmd)
     DPRINTF(("%s: Sending command (%.2x.%.2x), %d bytes at [%d]:%d ver: %d\n", __func__, group_id, cmd->hdr.cmd, cmd->hdr_wide.length, cmd->hdr.idx, cmd->hdr.qid, cmd->hdr_wide.version));
     ring->queued++;
     ring->cur = (ring->cur + 1) % getTxQueueSize();
-    ITLWM_CMD_KICK(ring);
+    ITLWM_CMD_KICK(ring, code);
     IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR, ring->qid << 16 | ring->cur);
 
     if (!async) {
@@ -10368,23 +10403,31 @@ iwx_init_hw(struct iwx_softc *sc)
     struct ieee80211com *ic = &sc->sc_ic;
     int err, i;
     
+    // Per-attempt reset. Everything below is scoped to THIS call of iwx_init_hw, which is
+    // reached only from iwx_init, i.e. only on the enable path.
+    ITLWM_HW_RESET();
+    ITLWM_HW_MARK(1);
     err = iwx_preinit(sc);
     if (err)
         return err;
     
+    ITLWM_HW_MARK(2);
     err = iwx_start_hw(sc);
     if (err) {
         XYLog("%s: could not initialize hardware\n", DEVNAME(sc));
         return err;
     }
     
+    ITLWM_HW_MARK(3);
     err = iwx_run_init_mvm_ucode(sc, 0);
     if (err)
         return err;
     
+    ITLWM_HW_MARK(4);
     if (!iwx_nic_lock(sc))
         return EBUSY;
     
+    ITLWM_HW_MARK(5);
     err = iwx_send_tx_ant_cfg(sc, iwx_fw_valid_tx_ant(sc));
     if (err) {
         XYLog("%s: could not init tx ant config (error %d)\n",
@@ -10395,6 +10438,7 @@ iwx_init_hw(struct iwx_softc *sc)
     iwx_toggle_tx_ant(sc, &sc->sc_mgmt_last_antenna_idx);
     
     if (sc->sc_tx_with_siso_diversity) {
+        ITLWM_HW_MARK(6);
         err = iwx_send_phy_cfg_cmd(sc);
         if (err) {
             XYLog("%s: could not send phy config (error %d)\n",
@@ -10403,6 +10447,7 @@ iwx_init_hw(struct iwx_softc *sc)
         }
     }
     
+    ITLWM_HW_MARK(7);
     err = iwx_send_bt_init_conf(sc);
     if (err) {
         XYLog("%s: could not init bt coex (error %d)\n",
@@ -10410,17 +10455,20 @@ iwx_init_hw(struct iwx_softc *sc)
         return err;
     }
     
+    ITLWM_HW_MARK(8);
     err = iwx_send_soc_conf(sc);
     if (err)
         return err;
     
     if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_DQA_SUPPORT)){
+        ITLWM_HW_MARK(9);
         err = iwx_send_dqa_cmd(sc);
         if (err)
             return err;
     }
     
     /* Add auxiliary station for scanning */
+    ITLWM_HW_MARK(10);
     err = iwx_add_aux_sta(sc);
     if (err) {
         XYLog("%s: could not add aux station (error %d)\n",
@@ -10436,6 +10484,7 @@ iwx_init_hw(struct iwx_softc *sc)
          */
         sc->sc_phyctxt[i].id = i;
         sc->sc_phyctxt[i].channel = &ic->ic_channels[1];
+        ITLWM_HW_MARK(11);
         err = iwx_phy_ctxt_cmd(sc, &sc->sc_phyctxt[i], 1, 1,
                                IWX_FW_CTXT_ACTION_ADD, 0);
         if (err) {
@@ -10446,6 +10495,7 @@ iwx_init_hw(struct iwx_softc *sc)
     }
     
     if (!isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_SET_LTR_GEN2)) {
+        ITLWM_HW_MARK(12);
         err = iwx_config_ltr(sc);
         if (err) {
             XYLog("%s: PCIe LTR configuration failed (error %d)\n",
@@ -10454,11 +10504,13 @@ iwx_init_hw(struct iwx_softc *sc)
     }
     
     if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_CT_KILL_BY_FW)) {
+        ITLWM_HW_MARK(13);
         err = iwx_send_temp_report_ths_cmd(sc);
         if (err)
             goto err;
     }
     
+    ITLWM_HW_MARK(14);
     err = iwx_power_update_device(sc);
     if (err) {
         XYLog("%s: could not send power command (error %d)\n",
@@ -10467,6 +10519,7 @@ iwx_init_hw(struct iwx_softc *sc)
     }
     
     if (sc->sc_nvm.lar_enabled) {
+        ITLWM_HW_MARK(15);
         err = iwx_send_update_mcc_cmd(sc, "ZZ");
         if (err) {
             XYLog("%s: could not init LAR (error %d)\n",
@@ -10475,6 +10528,7 @@ iwx_init_hw(struct iwx_softc *sc)
         }
     }
     
+    ITLWM_HW_MARK(16);
     err = iwx_config_umac_scan(sc);
     if (err) {
         XYLog("%s: could not configure scan (error %d)\n",
@@ -10482,6 +10536,7 @@ iwx_init_hw(struct iwx_softc *sc)
         goto err;
     }
     
+    ITLWM_HW_MARK(17);
     err = iwx_disable_beacon_filter(sc);
     if (err) {
         XYLog("%s: could not disable beacon filter (error %d)\n",
@@ -10489,6 +10544,7 @@ iwx_init_hw(struct iwx_softc *sc)
         goto err;
     }
     
+    ITLWM_HW_MARK(18);
 err:
     iwx_nic_unlock(sc);
     return err;

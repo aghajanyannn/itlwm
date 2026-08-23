@@ -102,6 +102,13 @@ extern uint32_t gItlwmWaitExitState;
 extern uint32_t gItlwmScanStateWakes;
 extern uint32_t gItlwmRadioSleeps;
 extern uint32_t gItlwmIwxStopCalls;
+extern uint32_t gItlwmHwMark;
+extern uint32_t gItlwmUcodeMark;
+extern int gItlwmUcodeErr;
+extern uint32_t gItlwmAliveMark;
+extern uint32_t gItlwmCmdKicks;
+extern uint32_t gItlwmCmdKicksAtHw;
+extern uint32_t gItlwmCmdLastCode;
 }
 extern "C" {
 extern uint32_t gItlwmPrepareBSDUngated;
@@ -482,6 +489,7 @@ static uint32_t sLastScanFailDes, sLastScanFailOr, sLastEssClears, sLastAssocEss
 static uint32_t sLastScanDoneEvents, sLastScanCompletes, sLastScanBackstops, sLastScanLastMs;
 // Mechanism 26.
 static uint32_t sLastRadioMark, sLastEnableCalls, sLastInitTaskCalls, sLastIwxStopCalls;
+static uint32_t sLastHwMark, sLastCmdKicks;
 static uint32_t sLastSetPowerOn, sLastSetPowerOff, sLastEnableAdapterCalls, sLastPmOffCalls;
 static uint32_t sLastIfFlags, sLastIcStateLive, sLastScFlagsLive;
 static bool sPublishedOnce;
@@ -572,6 +580,8 @@ void AirportItlwm::publishRuntimeCounters()
         gItlwmSkywalkRxDequeue == sLastSkywalkRxDequeue &&
         gItlwmLastQueueTimeCalls == sLastQueueTimeCalls &&
         (uint32_t)gItlwmRadioMark == sLastRadioMark &&
+        gItlwmHwMark == sLastHwMark &&
+        gItlwmCmdKicks == sLastCmdKicks &&
         gItlwmEnableCalls == sLastEnableCalls &&
         gItlwmInitTaskCalls == sLastInitTaskCalls &&
         gItlwmIwxStopCalls == sLastIwxStopCalls &&
@@ -584,6 +594,8 @@ void AirportItlwm::publishRuntimeCounters()
         scFlagsLive == sLastScFlagsLive)
         return;
     sLastRadioMark = (uint32_t)gItlwmRadioMark;
+    sLastHwMark = gItlwmHwMark;
+    sLastCmdKicks = gItlwmCmdKicks;
     sLastEnableCalls = gItlwmEnableCalls;
     sLastInitTaskCalls = gItlwmInitTaskCalls;
     sLastIwxStopCalls = gItlwmIwxStopCalls;
@@ -840,6 +852,35 @@ void AirportItlwm::publishRuntimeCounters()
     setProperty("ItlwmScanStateWakes", (UInt64)gItlwmScanStateWakes, 32);
     setProperty("ItlwmWaitExitState", (UInt64)gItlwmWaitExitState, 32);
     setProperty("ItlwmIwxStopCalls", (UInt64)gItlwmIwxStopCalls, 32);
+    // Mark0 = 8 splits here, and ALL FOUR of these are PER-ATTEMPT — reset at iwx_init_hw entry
+    // — unlike ItlwmPreinitMark/ItlwmInitMark, which are cumulative and are rewritten by both
+    // the attach-time and the enable-time call. A value those two share cannot be attributed to
+    // either, and reading them as enable-path values produced two wrong localisations.
+    //
+    // ItlwmHwMark — the last step ENTERED in iwx_init_hw. 0 = it never ran.
+    //   1 preinit  2 start_hw  3 run_init_mvm_ucode  4 nic_lock  5 tx_ant_cfg  6 phy_cfg
+    //   7 bt_init_conf  8 soc_conf  9 dqa_cmd  10 add_aux_sta  11 phy_ctxt  12 config_ltr
+    //   13 temp_report_ths  14 power_update_device  15 update_mcc("ZZ")  16 config_umac_scan
+    //   17 disable_beacon_filter  18 reached the end
+    // The errno is already ItlwmRadioErr0 — iwx_init_hw's return is what mark 8 latched.
+    setProperty("ItlwmHwMark", (UInt64)gItlwmHwMark, 32);
+    // ItlwmUcodeMark — the same numbering as ItlwmInitMark but scoped to this attempt, so 0
+    // means iwx_run_init_mvm_ucode did NOT run on the enable path and a 7 is not a stale
+    // attach-time success. 5 = the INIT_COMPLETE wait expired; 2 = the ALIVE wait did.
+    setProperty("ItlwmUcodeMark", (UInt64)gItlwmUcodeMark, 32);
+    setProperty("ItlwmUcodeErr", (UInt64)gItlwmUcodeErr, 32);
+    // ItlwmAliveMark — inside iwx_load_ucode_wait_alive: 1 read_firmware, 2 start_fw (the ALIVE
+    // wait), 3 load_pnvm (the PNVM_INIT_COMPLETE wait, a known EWOULDBLOCK source on this card).
+    // 0 = the firmware was not reloaded on this attempt.
+    setProperty("ItlwmAliveMark", (UInt64)gItlwmAliveMark, 32);
+    // CmdKicks - CmdKicksAtHw = host commands actually sent during this attempt. 0 with an
+    // EWOULDBLOCK means the wait that expired was NOT a command response — it was a bare
+    // firmware notification, which points at the ALIVE/PNVM waits rather than iwx_send_cmd.
+    // CmdLastCode is the wide id of the last command kicked: (group << 8) | opcode, e.g.
+    // 0x0C02 = REGULATORY_AND_NVM_GROUP / NVM_GET_INFO.
+    setProperty("ItlwmCmdKicks", (UInt64)gItlwmCmdKicks, 32);
+    setProperty("ItlwmCmdKicksAtHw", (UInt64)gItlwmCmdKicksAtHw, 32);
+    setProperty("ItlwmCmdLastCode", (UInt64)gItlwmCmdLastCode, 32);
     // SetPowerOn - EnableAdapterCalls MUST equal SetPowerGated. A disagreement means the wiring
     // is wrong, not the driver — discard the boot rather than reading anything into it.
     setProperty("ItlwmSetPowerOn", (UInt64)gItlwmSetPowerOn, 32);

@@ -570,15 +570,21 @@ including `itlwm.kext`, 952 undefined against the archived 25G83 with 0 missing 
 adds no external symbols), `mapdrv` 211 + 45 correct / 0 wrong, `callcheck` 94 slots / 0 wrong, and
 every new increment proved to survive preprocessing.
 
+**BOOT 1 IS DONE and the instrument caught a pristine stall on its first try:
+`ItlwmRadioMark0 = 8`, `ItlwmRadioErr0 = 35` (EWOULDBLOCK) — `iwx_init_hw()` failed on an expired
+wait — with `ItlwmIfFlags = 0x8807`, the predicted stalled value to the bit, which confirms the
+sticky-`IFF_UP` mechanism by measurement.** Round 2 (the per-attempt split that names which wait)
+is landed and unbooted. Full reading in mechanism 26.
+
 **Next steps, in order:**
 
-1. **Boot the instrument and read `ItlwmRadioMark0`.** A healthy boot is still worth having — it
-   validates the instrument against the known-good row in mechanism 26, and until that row is
-   confirmed no stalled reading means anything.
-2. **Then repair the exit Mark0 names.** Separately decide whether the *stickiness* deserves its
-   own repair, since it is a bug whichever sub-step fires — but it is upstream HAL code on the path
-   the machine's Wi-Fi depends on. **Do not repair and instrument in the same boot cycle.**
-3. **Then the remaining functional gaps**: 20 (LQM rate group — cheapest, the driver already has
+1. **Boot round 2 and read `ItlwmHwMark`**, then `UcodeMark` / `AliveMark` /
+   `CmdKicks - CmdKicksAtHw`. Those four name the exact wait that expired inside `iwx_init_hw`.
+2. **Then the stickiness repair, as its own change and its own boot.** It is justified by boot 1
+   on its own evidence and is worth having whichever wait is at fault, but it is upstream HAL code
+   on the path the machine's Wi-Fi depends on. **Do not repair and instrument in the same cycle.**
+3. **Then the root cause** of the expired wait.
+4. **Then the remaining functional gaps**: 20 (LQM rate group — cheapest, the driver already has
    the number), 17 (`networksetup` association report), 18 (roaming), 22 (Private Wi-Fi Address =
    Off). Mechanism 14 (scan request parameters) is unblocked now that completion corresponds to a
    real sweep.
@@ -3076,17 +3082,70 @@ every `ITLWM_*_OFFSET`, and every `Itlwm*` counter.
     `ItlwmGenLive`/`ItlwmScFlagsLive` read 0 as the not-an-`ItlIwx` sentinel. Check
     `ItlwmDeviceFamily` before reading anything into a zero.
 
+    ### BOOT 1 (2026-08-23 07:30, build `C4A9A73A`) — the instrument caught a PRISTINE stall
+
+    Untoggled and unslept, so nothing contaminated it: `DisableCalls = 0`, `SetPowerOff = 0`,
+    `PmOffCalls = 0`.
+
+    ```text
+    ItlwmRadioMark0 = 8    ItlwmRadioErr0 = 35 (EWOULDBLOCK)   ItlwmRadioMark = 8
+    ItlwmIfFlags = 0x8807  ItlwmIcStateLive = 0   ItlwmInitAttempts = 1
+    ItlwmEnableCalls = 1   ItlwmEnableAdapterCalls = 1  ItlwmSetPowerOn = 1  SetPowerGated = 0
+    ItlwmInitTaskCalls = 1 ItlwmInitTaskFatal = 0  ItlwmInitTaskFlags = 0x00008807
+    ItlwmGenLive = 1  IwxStopCalls = 0  RadioSleeps = 0  ScanStateWakes = 0  WaitExitState = 0
+    ScanReqRefused = ScanReqCalls = 199   ScanBeacons = 0   Country Code: ZZ
+    ```
+
+    **`iwx_init_hw()` returned EWOULDBLOCK — a `tsleep` expired.** And **`ItlwmIfFlags = 0x8807` is
+    the predicted stalled value to the bit**, so the sticky-`IFF_UP` mechanism is confirmed by
+    measurement, not just by reading. `0x8806` would have refuted it. The wiring identity holds
+    (`1 - 1 = 0`), `InitAttempts = 1` so nothing is a sum, and every counter downstream of mark 8
+    reads 0 exactly as it must. Capture archived at
+    `scratch/logs/mech26-stall-boot-2026-08-23-0730.ioreg`.
+
+    **`Mark0 = 14` has still NOT been observed**, so the formal self-test is unmet; what stands in
+    for it is the internal consistency above.
+
+    ### TWO WAYS TO MISREAD THIS BOOT, both of which were walked into before being caught
+
+    - **`ItlwmPreinitMark` and `ItlwmInitMark` are CUMULATIVE and cannot localise anything.**
+      `iwx_init_hw` calls `iwx_preinit` and `iwx_run_init_mvm_ucode` itself, so both are rewritten
+      on the enable path *when they run* — but both also ran at attach, and `InitMark = 7` is the
+      value a successful attach leaves. `7` therefore means either "the enable-path call succeeded"
+      or "the enable path never reached it", and nothing distinguishes them. `PreinitMark` is
+      luckier only by accident: its mark 1 is unconditional at entry, so a value of 3 must be from
+      the most recent call. **This is the same defect as `ItlwmDisableCalls`, one level up: a
+      counter that cannot separate two occasions is not evidence about either.** The cure is a
+      per-attempt counter, which is what round 2 adds.
+    - **`ItlwmIsrCount` measures a dead handler on this machine.** `ITLWM_ISR()` sits in
+      `iwx_intr`, but `sc_msix = 1` registers `iwx_intr_msix` instead. Do not read it, and do not
+      read `IsrAtKick` against it.
+
+    ### LANDED, UNBOOTED — round 2, the per-attempt split
+
+    All four are reset at `iwx_init_hw` entry, so **0 means "did not run on this attempt"** and no
+    value can be inherited from attach:
+
+    | property | says |
+    | --- | --- |
+    | `ItlwmHwMark` | last step ENTERED in `iwx_init_hw`, 1..18. 1 preinit, 2 start_hw, 3 run_init_mvm_ucode, 4 nic_lock, 5 tx_ant_cfg, 6 phy_cfg, 7 bt_init_conf, 8 soc_conf, 9 dqa_cmd, 10 add_aux_sta, 11 phy_ctxt, 12 config_ltr, 13 temp_report_ths, 14 power_update_device, 15 update_mcc("ZZ"), 16 config_umac_scan, 17 disable_beacon_filter, 18 reached the end |
+    | `ItlwmUcodeMark` / `Err` | `ItlwmInitMark`'s numbering, scoped to this attempt. 0 = it did not run; 2 = the ALIVE wait failed; 5 = the INIT_COMPLETE wait expired; 7 = it really did succeed here |
+    | `ItlwmAliveMark` | inside `iwx_load_ucode_wait_alive`: 1 read_firmware, 2 start_fw (the ALIVE wait), 3 load_pnvm (the PNVM wait — a known EWOULDBLOCK source on this card) |
+    | `ItlwmCmdKicks - ItlwmCmdKicksAtHw` | host commands sent during this attempt. **0 with EWOULDBLOCK means the expired wait was not a command response at all**, which points at the ALIVE/PNVM waits rather than `iwx_send_cmd` |
+    | `ItlwmCmdLastCode` | wide id of the last command kicked, `(group << 8) | opcode`. `0x0C02` = `REGULATORY_AND_NVM_GROUP` / `NVM_GET_INFO` |
+
+    The errno needs no new counter: `iwx_init_hw`'s return is already `ItlwmRadioErr0`.
+
     ### Next steps, in order
 
-    1. **Boot it and read `ItlwmRadioMark0`.** The bug is intermittent, so a healthy boot is still
-       useful: it validates the instrument (`Mark0 = 14`, `ItlwmIfFlags = 0x8847`,
-       `ItlwmWaitExitState = 1`, `ItlwmRadioSleeps = 1`, `ItlwmInitTaskCalls = 1`). Only once that
-       row is confirmed does a stalled reading mean anything.
-    2. **Then repair the exit Mark0 names** — and separately decide whether the *stickiness* is
-       worth repairing on its own, since it is a bug whichever sub-step fires. The obvious candidate
-       is clearing `IFF_UP` when the enable did not reach mark 14, but that is upstream HAL code on
-       the path the machine's Wi-Fi depends on, and it must not ship before the instrument has
-       named the failure. **Do not repair and instrument in the same boot cycle.**
+    1. **Boot round 2 and read `ItlwmHwMark` first**, then `UcodeMark`, `AliveMark`, and
+       `CmdKicks - CmdKicksAtHw`. Together they name the exact wait that expired.
+    2. **Then the stickiness repair, as its own change and its own boot** — clearing `IFF_UP` when
+       the enable did not reach mark 14, so a failed enable is retried instead of latched. It is
+       justified by boot 1 on its own evidence and is worth having whichever wait turns out to be
+       at fault, but it is upstream HAL code on the path the machine's Wi-Fi depends on.
+       **Do not repair and instrument in the same boot cycle.**
+    3. **Then the root cause** of the expired wait.
 
     **Done when** ten consecutive boots reach `ItlwmIcStateLive != 0` with no power toggle.
 

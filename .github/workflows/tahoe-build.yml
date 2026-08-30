@@ -32,11 +32,10 @@ jobs:
           c = cpp.read_text()
 
           # ============================================================
-          # 1. HEADER
+          # HEADER
           # ============================================================
 
           if "awdlVifCreateGated" not in h:
-
               marker = (
                   "    virtual IOReturn "
                   "getHardwareAddress(IOEthernetAddress* addrP) override;\n"
@@ -48,37 +47,39 @@ jobs:
                   )
 
               addition = marker + r"""
-#if __IO80211_TARGET >= __MAC_26_0
-    // Experimental Tahoe AWDL virtual-interface test.
-    // Non-virtual helpers: no new vtable slots.
-    static IOReturn awdlVifCreateGated(
-        OSObject *owner,
-        void *arg0,
-        void *arg1,
-        void *arg2,
-        void *arg3
-    );
+          #if __IO80211_TARGET >= __MAC_26_0
+              // Experimental Tahoe AWDL virtual-interface test.
+              static IOReturn awdlVifCreateGated(
+                  OSObject *owner,
+                  void *arg0,
+                  void *arg1,
+                  void *arg2,
+                  void *arg3
+              );
 
-    IOReturn doAwdlVifCreate(void);
-    void tryAwdlVifCreate(void);
+              IOReturn doAwdlVifCreate(void);
+              void tryAwdlVifCreate(void);
 
-    IO80211VirtualInterface *fTestAwdlVif;
-    uint32_t fTestAwdlTicks;
-    bool fTestAwdlAttempted;
-#endif
-"""
+              IO80211VirtualInterface *fTestAwdlVif;
+              uint32_t fTestAwdlTicks;
+              bool fTestAwdlAttempted;
+          #endif
+          """
+
+              # Remove indentation intentionally present only
+              # to keep the GitHub Actions YAML valid.
+              addition = addition.replace(
+                  "\n          ",
+                  "\n"
+              )
 
               h = h.replace(marker, addition, 1)
 
           # ============================================================
-          # 2. CPP IMPLEMENTATION
-          #
-          # Put it after the global command-gate declaration.
-          # This anchor exists near the top of AirportItlwmV2.cpp.
+          # CPP IMPLEMENTATION
           # ============================================================
 
           if "gAwdlTestAttempt" not in c:
-
               marker = "IOCommandGate *_fCommandGate;\n"
 
               if marker not in c:
@@ -88,160 +89,147 @@ jobs:
 
               implementation = r"""
 
-#if __IO80211_TARGET >= __MAC_26_0
+          #if __IO80211_TARGET >= __MAC_26_0
 
-static uint32_t gAwdlTestAttempt = 0;
-static uint32_t gAwdlTestAttachOK = 0;
-static uint32_t gAwdlTestEnableOK = 0;
-static uint32_t gAwdlTestRole = 0;
-static uint32_t gAwdlTestHasObject = 0;
-static int32_t  gAwdlTestEnableRet = 0;
+          static uint32_t gAwdlTestAttempt = 0;
+          static uint32_t gAwdlTestAttachOK = 0;
+          static uint32_t gAwdlTestEnableOK = 0;
+          static uint32_t gAwdlTestRole = 0;
+          static uint32_t gAwdlTestHasObject = 0;
+          static int32_t  gAwdlTestEnableRet = 0;
 
+          IOReturn
+          AirportItlwm::awdlVifCreateGated(
+              OSObject *owner,
+              void *,
+              void *,
+              void *,
+              void *)
+          {
+              AirportItlwm *self =
+                  OSDynamicCast(AirportItlwm, owner);
 
-IOReturn
-AirportItlwm::awdlVifCreateGated(
-    OSObject *owner,
-    void *,
-    void *,
-    void *,
-    void *)
-{
-    AirportItlwm *self =
-        OSDynamicCast(AirportItlwm, owner);
+              if (self == NULL)
+                  return kIOReturnBadArgument;
 
-    if (self == NULL)
-        return kIOReturnBadArgument;
+              return self->doAwdlVifCreate();
+          }
 
-    return self->doAwdlVifCreate();
-}
+          IOReturn
+          AirportItlwm::doAwdlVifCreate(void)
+          {
+              if (fTestAwdlAttempted)
+                  return kIOReturnSuccess;
 
+              fTestAwdlAttempted = true;
+              gAwdlTestAttempt++;
 
-IOReturn
-AirportItlwm::doAwdlVifCreate(void)
-{
-    if (fTestAwdlAttempted)
-        return kIOReturnSuccess;
+              if (fHalService == NULL)
+                  return kIOReturnNotReady;
 
-    fTestAwdlAttempted = true;
-    gAwdlTestAttempt++;
+              IOEthernetAddress hw;
+              bzero(&hw, sizeof(hw));
 
-    if (fHalService == NULL)
-        return kIOReturnNotReady;
+              IOReturn hwret =
+                  getHardwareAddress(&hw);
 
-    IOEthernetAddress hw;
-    bzero(&hw, sizeof(hw));
+              if (hwret != kIOReturnSuccess)
+                  return hwret;
 
-    IOReturn hwret = getHardwareAddress(&hw);
+              struct ether_addr mac;
+              bzero(&mac, sizeof(mac));
 
-    if (hwret != kIOReturnSuccess)
-        return hwret;
+              memcpy(
+                  mac.octet,
+                  hw.bytes,
+                  sizeof(mac.octet)
+              );
 
-    struct ether_addr mac;
-    bzero(&mac, sizeof(mac));
+              // Locally administered unicast MAC.
+              mac.octet[0] |= 0x02;
+              mac.octet[0] &= 0xFE;
+              mac.octet[5] ^= 0x40;
 
-    memcpy(
-        mac.octet,
-        hw.bytes,
-        sizeof(mac.octet)
-    );
+              IO80211VirtualInterface *vif = NULL;
 
-    /*
-     * Locally administered unicast address derived from
-     * the infrastructure interface address.
-     */
-    mac.octet[0] |= 0x02;
-    mac.octet[0] &= 0xFE;
-    mac.octet[5] ^= 0x40;
+              bool attached =
+                  super::attachVirtualInterface(
+                      &vif,
+                      &mac,
+                      APPLE80211_VIF_AWDL,
+                      true
+                  );
 
-    IO80211VirtualInterface *vif = NULL;
+              if (!attached || vif == NULL) {
+                  gAwdlTestEnableRet =
+                      (int32_t)kIOReturnError;
 
-    bool attached =
-        super::attachVirtualInterface(
-            &vif,
-            &mac,
-            APPLE80211_VIF_AWDL,
-            true
-        );
+                  return kIOReturnError;
+              }
 
-    if (!attached || vif == NULL) {
-        gAwdlTestEnableRet =
-            (int32_t)kIOReturnError;
+              fTestAwdlVif = vif;
 
-        return kIOReturnError;
-    }
+              gAwdlTestAttachOK++;
+              gAwdlTestHasObject = 1;
 
-    fTestAwdlVif = vif;
+              gAwdlTestRole =
+                  (uint32_t)vif->getInterfaceRole();
 
-    gAwdlTestAttachOK++;
-    gAwdlTestHasObject = 1;
-    gAwdlTestRole =
-        (uint32_t)vif->getInterfaceRole();
+              SInt32 er =
+                  enableVirtualInterface(vif);
 
-    /*
-     * Use the controller's existing virtual-interface
-     * enable path.
-     *
-     * AirportItlwm already implements the normal
-     * enableVirtualInterface logic.
-     */
-    SInt32 er =
-        enableVirtualInterface(vif);
+              gAwdlTestEnableRet = er;
 
-    gAwdlTestEnableRet = er;
+              if (er == 0)
+                  gAwdlTestEnableOK++;
 
-    if (er == 0)
-        gAwdlTestEnableOK++;
+              return er;
+          }
 
-    return er;
-}
+          void
+          AirportItlwm::tryAwdlVifCreate(void)
+          {
+              if (fTestAwdlAttempted)
+                  return;
 
+              if (fHalService == NULL)
+                  return;
 
-void
-AirportItlwm::tryAwdlVifCreate(void)
-{
-    if (fTestAwdlAttempted)
-        return;
+              if (_fCommandGate == NULL)
+                  return;
 
-    if (fHalService == NULL)
-        return;
+              struct ieee80211com *ic =
+                  fHalService->get80211Controller();
 
-    if (_fCommandGate == NULL)
-        return;
+              if (ic == NULL)
+                  return;
 
-    struct ieee80211com *ic =
-        fHalService->get80211Controller();
+              // Only test once normal Wi-Fi is connected.
+              if (ic->ic_state != IEEE80211_S_RUN) {
+                  fTestAwdlTicks = 0;
+                  return;
+              }
 
-    if (ic == NULL)
-        return;
+              // watchdogAction is roughly 1 Hz.
+              if (++fTestAwdlTicks < 5)
+                  return;
 
-    /*
-     * Do not try to create the AWDL interface until
-     * infrastructure Wi-Fi is actually associated.
-     */
-    if (ic->ic_state != IEEE80211_S_RUN) {
-        fTestAwdlTicks = 0;
-        return;
-    }
+              _fCommandGate->runAction(
+                  (IOCommandGate::Action)awdlVifCreateGated,
+                  NULL,
+                  NULL,
+                  NULL,
+                  NULL
+              );
+          }
 
-    /*
-     * watchdogAction runs roughly once per second.
-     * Wait several ticks after reaching RUN.
-     */
-    if (++fTestAwdlTicks < 5)
-        return;
+          #endif
+          """
 
-    _fCommandGate->runAction(
-        awdlVifCreateGated,
-        NULL,
-        NULL,
-        NULL,
-        NULL
-    );
-}
-
-#endif
-
-"""
+              implementation = implementation.replace(
+                  "\n          ",
+                  "\n"
+              )
 
               c = c.replace(
                   marker,
@@ -250,11 +238,10 @@ AirportItlwm::tryAwdlVifCreate(void)
               )
 
           # ============================================================
-          # 3. INITIALIZE TEST STATE IN AirportItlwm::init()
+          # INITIALIZE TEST STATE
           # ============================================================
 
           if "fTestAwdlAttempted = false;" not in c:
-
               pattern = re.compile(
                   r"(bool\s+AirportItlwm::init\s*"
                   r"\(\s*OSDictionary\s*\*\s*properties\s*\)"
@@ -269,13 +256,18 @@ AirportItlwm::tryAwdlVifCreate(void)
                   )
 
               init_code = r"""
-#if __IO80211_TARGET >= __MAC_26_0
-    fTestAwdlVif = NULL;
-    fTestAwdlTicks = 0;
-    fTestAwdlAttempted = false;
-#endif
+          #if __IO80211_TARGET >= __MAC_26_0
+              fTestAwdlVif = NULL;
+              fTestAwdlTicks = 0;
+              fTestAwdlAttempted = false;
+          #endif
 
-"""
+          """
+
+              init_code = init_code.replace(
+                  "\n          ",
+                  "\n"
+              )
 
               c = (
                   c[:match.end()]
@@ -284,11 +276,10 @@ AirportItlwm::tryAwdlVifCreate(void)
               )
 
           # ============================================================
-          # 4. CALL TEST FROM EXISTING WATCHDOG
+          # WATCHDOG CALL
           # ============================================================
 
           if "AWDL_VIF_TEST_WATCHDOG_CALL" not in c:
-
               pattern = re.compile(
                   r"(void\s+AirportItlwm::watchdogAction\s*"
                   r"\(\s*IOTimerEventSource\s*\*\s*timer\s*\)"
@@ -303,12 +294,17 @@ AirportItlwm::tryAwdlVifCreate(void)
                   )
 
               watchdog_code = r"""
-#if __IO80211_TARGET >= __MAC_26_0
-    // AWDL_VIF_TEST_WATCHDOG_CALL
-    tryAwdlVifCreate();
-#endif
+          #if __IO80211_TARGET >= __MAC_26_0
+              // AWDL_VIF_TEST_WATCHDOG_CALL
+              tryAwdlVifCreate();
+          #endif
 
-"""
+          """
+
+              watchdog_code = watchdog_code.replace(
+                  "\n          ",
+                  "\n"
+              )
 
               c = (
                   c[:match.end()]
@@ -320,7 +316,7 @@ AirportItlwm::tryAwdlVifCreate(void)
           cpp.write_text(c)
 
           print("======================================")
-          print("AWDL VIF Test 3 patch applied")
+          print("AWDL VIF Test 3 applied successfully")
           print("======================================")
           PY
 
@@ -366,11 +362,7 @@ AirportItlwm::tryAwdlVifCreate(void)
         if: success()
         run: |
           echo "===== BUILT AIRPORTITLWM ====="
-
-          find . \
-            -type d \
-            -name "AirportItlwm.kext" \
-            -print
+          find . -type d -name "AirportItlwm.kext" -print
 
       - name: Package
         if: success()
@@ -403,8 +395,7 @@ AirportItlwm::tryAwdlVifCreate(void)
           echo "Packaging:"
           echo "$KEXT"
 
-          rm -f \
-            AirportItlwm-Tahoe-AWDL-VIF-Test3.zip
+          rm -f AirportItlwm-Tahoe-AWDL-VIF-Test3.zip
 
           ditto \
             -c \

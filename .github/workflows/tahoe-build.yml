@@ -1,4 +1,4 @@
-name: Build Tahoe AirportItlwm
+name: Build Tahoe AWDL Probe 1
 
 on:
   workflow_dispatch:
@@ -15,6 +15,192 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git
 
+      - name: Apply AWDL Probe 1
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          hpp = Path("AirportItlwm/AirportItlwmV2.hpp")
+          cpp = Path("AirportItlwm/AirportItlwmV2.cpp")
+
+          h = hpp.read_text()
+
+          needle = '    virtual void *getFaultReporterFromDriver() override;\n'
+
+          addition = r'''
+          #if __IO80211_TARGET >= __MAC_26_0
+              // AWDL Probe #1 — observe Tahoe virtual-interface lifecycle.
+              virtual IO80211VirtualInterface *createVirtualInterface(ether_addr *, UInt) override;
+              virtual bool attachVirtualInterface(IO80211VirtualInterface **, ether_addr *, UInt, bool) override;
+              virtual bool detachVirtualInterface(IO80211VirtualInterface *, bool) override;
+              virtual SInt32 enableVirtualInterface(IO80211VirtualInterface *) override;
+              virtual SInt32 disableVirtualInterface(IO80211VirtualInterface *) override;
+          #endif
+          '''
+
+          if "AWDL Probe #1" not in h:
+              if needle not in h:
+                  raise SystemExit("Header insertion point not found")
+              h = h.replace(needle, needle + addition, 1)
+              hpp.write_text(h)
+
+          c = cpp.read_text()
+
+          globals_needle = 'IOCommandGate *_fCommandGate;\n'
+
+          globals_add = r'''
+
+          #if __IO80211_TARGET >= __MAC_26_0
+          // AWDL Probe #1 counters.
+          static volatile uint32_t gItlwmVifCreateCalls = 0;
+          static volatile uint32_t gItlwmVifCreateOK = 0;
+          static volatile uint32_t gItlwmVifAttachCalls = 0;
+          static volatile uint32_t gItlwmVifAttachOK = 0;
+          static volatile uint32_t gItlwmVifEnableCalls = 0;
+          static volatile uint32_t gItlwmVifDisableCalls = 0;
+          static volatile uint32_t gItlwmVifDetachCalls = 0;
+          static volatile uint32_t gItlwmVifLastRole = 0;
+          static volatile int32_t  gItlwmVifLastEnableRet = 0;
+          #endif
+          '''
+
+          if "gItlwmVifCreateCalls" not in c:
+              if globals_needle not in c:
+                  raise SystemExit("CPP globals insertion point not found")
+              c = c.replace(
+                  globals_needle,
+                  globals_needle + globals_add,
+                  1
+              )
+
+          impl_needle = '#if __IO80211_TARGET >= __MAC_26_0\n// Tahoe consumed'
+
+          impl = r'''
+          #if __IO80211_TARGET >= __MAC_26_0
+
+          IO80211VirtualInterface *
+          AirportItlwm::createVirtualInterface(ether_addr *addr, UInt role)
+          {
+              gItlwmVifCreateCalls++;
+              gItlwmVifLastRole = role;
+
+              IO80211VirtualInterface *v =
+                  super::createVirtualInterface(addr, role);
+
+              if (v != NULL)
+                  gItlwmVifCreateOK++;
+
+              return v;
+          }
+
+          bool
+          AirportItlwm::attachVirtualInterface(
+              IO80211VirtualInterface **interface,
+              ether_addr *addr,
+              UInt role,
+              bool option)
+          {
+              gItlwmVifAttachCalls++;
+              gItlwmVifLastRole = role;
+
+              bool ret =
+                  super::attachVirtualInterface(
+                      interface,
+                      addr,
+                      role,
+                      option
+                  );
+
+              if (ret)
+                  gItlwmVifAttachOK++;
+
+              return ret;
+          }
+
+          bool
+          AirportItlwm::detachVirtualInterface(
+              IO80211VirtualInterface *interface,
+              bool option)
+          {
+              gItlwmVifDetachCalls++;
+
+              return super::detachVirtualInterface(
+                  interface,
+                  option
+              );
+          }
+
+          SInt32
+          AirportItlwm::enableVirtualInterface(
+              IO80211VirtualInterface *interface)
+          {
+              gItlwmVifEnableCalls++;
+
+              SInt32 ret =
+                  super::enableVirtualInterface(interface);
+
+              gItlwmVifLastEnableRet = ret;
+
+              return ret;
+          }
+
+          SInt32
+          AirportItlwm::disableVirtualInterface(
+              IO80211VirtualInterface *interface)
+          {
+              gItlwmVifDisableCalls++;
+
+              return super::disableVirtualInterface(interface);
+          }
+
+          #endif
+
+          '''
+
+          if "AirportItlwm::createVirtualInterface(ether_addr *addr" not in c:
+              if impl_needle not in c:
+                  raise SystemExit("Implementation insertion point not found")
+
+              c = c.replace(
+                  impl_needle,
+                  impl + impl_needle,
+                  1
+              )
+
+          publish_needle = '''void AirportItlwm::publishRuntimeCounters()
+          {
+          '''
+
+          publish_add = '''void AirportItlwm::publishRuntimeCounters()
+          {
+              // AWDL Probe #1: publish outside Apple's virtual-interface callbacks.
+              setProperty("ItlwmVifCreateCalls", (UInt64)gItlwmVifCreateCalls, 32);
+              setProperty("ItlwmVifCreateOK", (UInt64)gItlwmVifCreateOK, 32);
+              setProperty("ItlwmVifAttachCalls", (UInt64)gItlwmVifAttachCalls, 32);
+              setProperty("ItlwmVifAttachOK", (UInt64)gItlwmVifAttachOK, 32);
+              setProperty("ItlwmVifEnableCalls", (UInt64)gItlwmVifEnableCalls, 32);
+              setProperty("ItlwmVifDisableCalls", (UInt64)gItlwmVifDisableCalls, 32);
+              setProperty("ItlwmVifDetachCalls", (UInt64)gItlwmVifDetachCalls, 32);
+              setProperty("ItlwmVifLastRole", (UInt64)gItlwmVifLastRole, 32);
+              setProperty("ItlwmVifLastEnableRet",
+                          (UInt64)(uint32_t)gItlwmVifLastEnableRet, 32);
+          '''
+
+          if "ItlwmVifCreateCalls\"" not in c:
+              if publish_needle not in c:
+                  raise SystemExit("publishRuntimeCounters insertion point not found")
+
+              c = c.replace(
+                  publish_needle,
+                  publish_add,
+                  1
+              )
+
+          cpp.write_text(c)
+
+          print("AWDL Probe #1 applied.")
+          PY
+
       - name: Build AirportItlwm Tahoe
         run: |
           xcodebuild \
@@ -23,11 +209,11 @@ jobs:
             -configuration Release \
             build
 
-      - name: Find built kext
+      - name: Find Tahoe kext
         run: |
           find build -name "AirportItlwm.kext" -print
 
-      - name: Package
+      - name: Package AWDL Probe 1
         run: |
           KEXT="$(find build -path '*Tahoe*' -name 'AirportItlwm.kext' | head -1)"
 
@@ -38,10 +224,10 @@ jobs:
 
           ditto -c -k --sequesterRsrc --keepParent \
             "$KEXT" \
-            AirportItlwm-Tahoe.zip
+            AirportItlwm-Tahoe-AWDL-PROBE1.zip
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: AirportItlwm-Tahoe
-          path: AirportItlwm-Tahoe.zip
+          name: AirportItlwm-Tahoe-AWDL-PROBE1
+          path: AirportItlwm-Tahoe-AWDL-PROBE1.zip

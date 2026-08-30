@@ -1,11 +1,11 @@
-name: Build Tahoe AWDL VIF Test 2
+name: Build Tahoe AirportItlwm
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15
 
     steps:
       - name: Checkout
@@ -13,10 +13,14 @@ jobs:
 
       - name: Install MacKernelSDK
         run: |
+          rm -rf MacKernelSDK
           git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git
 
-      - name: Apply AWDL VIF Test 2
+      - name: Apply AWDL VIF Test #2
+        shell: bash
         run: |
+          set -euo pipefail
+
           python3 <<'PY'
           from pathlib import Path
 
@@ -26,53 +30,48 @@ jobs:
           h = hpp.read_text()
           c = cpp.read_text()
 
-          # ---------- HEADER ----------
-          marker = "    void publishRuntimeCounters(void);\n"
+          # ============================================================
+          # HEADER PATCH
+          # ============================================================
 
-          add = r'''
+          h_marker = """    virtual IOReturn setLinkState(IO80211NetworkLinkState state, int reason) override;
+          """
+
+          h_insert = """    virtual IOReturn setLinkState(IO80211NetworkLinkState state, int reason) override;
+
               // AWDL VIF Test #2
               static IOReturn awdlVifCreateGated(
                   OSObject *, void *, void *, void *, void *);
 
+              IOReturn doAwdlVifCreate(void);
               void tryAwdlVifCreate(void);
 
               IO80211VirtualInterface *fTestAwdlVif;
               uint32_t fTestAwdlTicks;
               bool fTestAwdlAttempted;
-          '''
+          """
 
-          if "AWDL VIF Test #2" not in h:
-              if marker not in h:
-                  raise SystemExit("header marker missing")
-              h = h.replace(marker, marker + add, 1)
+          if "awdlVifCreateGated" not in h:
+              if h_marker not in h:
+                  raise SystemExit("Header marker not found")
 
-          # ---------- INIT ----------
-          init_marker = "bool AirportItlwm::init(OSDictionary *properties)\n{"
+              h = h.replace(
+                  h_marker,
+                  h_insert,
+                  1
+              )
 
-          # Add initialization just after init begins.
-          init_find = """bool AirportItlwm::init(OSDictionary *properties)
+              hpp.write_text(h)
+
+          # ============================================================
+          # CPP — AWDL VIRTUAL INTERFACE IMPLEMENTATION
+          # ============================================================
+
+          c_marker = """void AirportItlwm::dataLinkLayerAttachComplete(IO80211Interface *interface)
           {
           """
 
-          init_replace = """bool AirportItlwm::init(OSDictionary *properties)
-          {
-          #if __IO80211_TARGET >= __MAC_26_0
-              fTestAwdlVif = NULL;
-              fTestAwdlTicks = 0;
-              fTestAwdlAttempted = false;
-          #endif
-          """
-
-          if "fTestAwdlAttempted = false" not in c:
-              if init_find not in c:
-                  raise SystemExit("init marker missing")
-              c = c.replace(init_find, init_replace, 1)
-
-          # ---------- IMPLEMENTATION ----------
-          impl_marker = "#if __IO80211_TARGET >= __MAC_26_0\n// Tahoe consumed"
-
-          impl = r'''
-          #if __IO80211_TARGET >= __MAC_26_0
+          c_insert = r"""#if __IO80211_TARGET >= __MAC_26_0
 
           static uint32_t gAwdlTestAttempt = 0;
           static uint32_t gAwdlTestAttachOK = 0;
@@ -95,22 +94,29 @@ jobs:
               if (!self)
                   return kIOReturnBadArgument;
 
-              if (self->fTestAwdlAttempted)
+              return self->doAwdlVifCreate();
+          }
+
+          IOReturn
+          AirportItlwm::doAwdlVifCreate(void)
+          {
+              if (fTestAwdlAttempted)
                   return kIOReturnSuccess;
 
-              self->fTestAwdlAttempted = true;
+              fTestAwdlAttempted = true;
               gAwdlTestAttempt++;
 
               IOEthernetAddress hw;
               bzero(&hw, sizeof(hw));
 
-              if (self->getHardwareAddress(&hw) != kIOReturnSuccess)
+              if (getHardwareAddress(&hw) != kIOReturnSuccess)
                   return kIOReturnError;
 
               ether_addr mac;
               memcpy(&mac, hw.bytes, 6);
 
-              // Locally administered, unicast address.
+              // Create a locally-administered unicast MAC
+              // derived from the physical Wi-Fi MAC.
               mac.octet[0] |= 0x02;
               mac.octet[0] &= 0xFE;
               mac.octet[5] ^= 0x40;
@@ -118,7 +124,7 @@ jobs:
               IO80211VirtualInterface *vif = NULL;
 
               bool attached =
-                  self->super::attachVirtualInterface(
+                  super::attachVirtualInterface(
                       &vif,
                       &mac,
                       APPLE80211_VIF_AWDL,
@@ -130,12 +136,13 @@ jobs:
 
               gAwdlTestAttachOK++;
               gAwdlTestHasObject = 1;
-              gAwdlTestRole = vif->getInterfaceRole();
+              gAwdlTestRole =
+                  vif->getInterfaceRole();
 
-              self->fTestAwdlVif = vif;
+              fTestAwdlVif = vif;
 
               SInt32 er =
-                  self->super::enableVirtualInterface(vif);
+                  super::enableVirtualInterface(vif);
 
               gAwdlTestEnableRet = er;
 
@@ -143,6 +150,7 @@ jobs:
                   gAwdlTestEnableOK++;
 
                   vif->setEnabledBySystem(true);
+
                   vif->setLinkState(
                       kIO80211NetworkLinkUp,
                       0
@@ -156,7 +164,6 @@ jobs:
               return er;
           }
 
-
           void
           AirportItlwm::tryAwdlVifCreate(void)
           {
@@ -166,11 +173,14 @@ jobs:
               struct ieee80211com *ic =
                   fHalService->get80211Controller();
 
-              // Wait for normal infrastructure Wi-Fi first.
+              if (ic == NULL)
+                  return;
+
               if (ic->ic_state != IEEE80211_S_RUN)
                   return;
 
-              // 10 watchdog ticks ~= 10 seconds connected.
+              // Give the normal Wi-Fi interface several poll cycles
+              // after association before attempting the AWDL VIF.
               if (++fTestAwdlTicks < 10)
                   return;
 
@@ -181,89 +191,130 @@ jobs:
 
           #endif
 
-          '''
+          """
 
-          if "AirportItlwm::awdlVifCreateGated" not in c:
-              if impl_marker not in c:
-                  raise SystemExit("implementation marker missing")
+          if "gAwdlTestAttempt" not in c:
+              if c_marker not in c:
+                  raise SystemExit("CPP marker not found")
+
               c = c.replace(
-                  impl_marker,
-                  impl + impl_marker,
+                  c_marker,
+                  c_insert + c_marker,
                   1
               )
 
-          # ---------- WATCHDOG ----------
-          wd_find = """    publishRuntimeCounters();
-          #endif
-              watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
+          # ============================================================
+          # INITIALIZE TEST STATE
+          # ============================================================
+
+          init_marker = """    fPendingIEData = NULL;
+              fPendingIELen = 0;
           """
 
-          wd_replace = """    publishRuntimeCounters();
+          init_insert = """    fPendingIEData = NULL;
+              fPendingIELen = 0;
+
+              fTestAwdlVif = NULL;
+              fTestAwdlTicks = 0;
+              fTestAwdlAttempted = false;
+          """
+
+          if "fTestAwdlAttempted = false" not in c:
+              if init_marker not in c:
+                  raise SystemExit("Init marker not found")
+
+              c = c.replace(
+                  init_marker,
+                  init_insert,
+                  1
+              )
+
+          # ============================================================
+          # CALL AWDL TEST FROM EXISTING POLL PATH
+          # ============================================================
+
+          poll_marker = """if_handle_delayed_autojoin(ifp);
+          """
+
+          poll_insert = """if_handle_delayed_autojoin(ifp);
+
+              // AWDL VIF Test #2
               tryAwdlVifCreate();
-          #endif
-              watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
           """
 
           if "tryAwdlVifCreate();" not in c:
-              if wd_find not in c:
-                  raise SystemExit("watchdog marker missing")
-              c = c.replace(wd_find, wd_replace, 1)
+              if poll_marker not in c:
+                  raise SystemExit("Poll marker not found")
 
-          # ---------- COUNTERS ----------
-          pub_find = """void AirportItlwm::publishRuntimeCounters()
-          {
-          """
+              c = c.replace(
+                  poll_marker,
+                  poll_insert,
+                  1
+              )
 
-          pub_replace = """void AirportItlwm::publishRuntimeCounters()
-          {
-              setProperty("ItlwmAwdlAttempt",
-                          (UInt64)gAwdlTestAttempt, 32);
-              setProperty("ItlwmAwdlAttachOK",
-                          (UInt64)gAwdlTestAttachOK, 32);
-              setProperty("ItlwmAwdlEnableOK",
-                          (UInt64)gAwdlTestEnableOK, 32);
-              setProperty("ItlwmAwdlRole",
-                          (UInt64)gAwdlTestRole, 32);
-              setProperty("ItlwmAwdlHasObject",
-                          (UInt64)gAwdlTestHasObject, 32);
-              setProperty("ItlwmAwdlEnableRet",
-                          (UInt64)(uint32_t)gAwdlTestEnableRet, 32);
-          """
-
-          if '"ItlwmAwdlAttempt"' not in c:
-              if pub_find not in c:
-                  raise SystemExit("publish marker missing")
-              c = c.replace(pub_find, pub_replace, 1)
-
-          hpp.write_text(h)
           cpp.write_text(c)
 
-          print("AWDL VIF Test #2 applied")
+          print("AWDL VIF Test #2 patch applied successfully.")
           PY
+
+          echo "===== PATCHED SYMBOLS ====="
+
+          grep -n \
+            "awdlVifCreateGated\|doAwdlVifCreate\|tryAwdlVifCreate\|gAwdlTest\|fTestAwdl" \
+            AirportItlwm/AirportItlwmV2.hpp \
+            AirportItlwm/AirportItlwmV2.cpp
 
       - name: Build AirportItlwm Tahoe
         run: |
+          set -o pipefail
+
           xcodebuild \
-            -jobs 8 \
-            -target "AirportItlwm-Tahoe" \
+            -project itlwm.xcodeproj \
+            -scheme AirportItlwm-Tahoe \
             -configuration Release \
-            build
+            CODE_SIGNING_ALLOWED=NO \
+            build | tee build.log
+
+      - name: Show build tail
+        if: always()
+        run: |
+          echo "===== LAST 250 LINES ====="
+          tail -250 build.log || true
+
+          echo ""
+          echo "===== COMPILER ERRORS ====="
+          grep -n "error:" build.log | tail -80 || true
+
+      - name: Find built kext
+        if: success()
+        run: |
+          echo "===== BUILT AIRPORTITLWM ====="
+          find build -name "AirportItlwm.kext" -print
 
       - name: Package
+        if: success()
         run: |
           KEXT="$(find build -path '*Tahoe*' -name 'AirportItlwm.kext' | head -1)"
 
           if [ -z "$KEXT" ]; then
-            echo "Tahoe kext not found"
+            echo "Tahoe AirportItlwm.kext not found"
             exit 1
           fi
 
-          ditto -c -k --sequesterRsrc --keepParent \
+          echo "Packaging:"
+          echo "$KEXT"
+
+          ditto \
+            -c \
+            -k \
+            --sequesterRsrc \
+            --keepParent \
             "$KEXT" \
-            AirportItlwm-Tahoe-AWDL-VIF-TEST2.zip
+            AirportItlwm-Tahoe-AWDL-VIF-Test2.zip
 
       - name: Upload
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: AirportItlwm-Tahoe-AWDL-VIF-TEST2
-          path: AirportItlwm-Tahoe-AWDL-VIF-TEST2.zip
+          name: AirportItlwm-Tahoe-AWDL-VIF-Test2
+          path: AirportItlwm-Tahoe-AWDL-VIF-Test2.zip

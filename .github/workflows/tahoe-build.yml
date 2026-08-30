@@ -1,0 +1,47 @@
+name: Build Tahoe AirportItlwm
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MacKernelSDK
+        run: |
+          git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git
+
+      - name: Build AirportItlwm Tahoe
+        run: |
+          xcodebuild \
+            -jobs 8 \
+            -target "AirportItlwm-Tahoe" \
+            -configuration Release \
+            build
+
+      - name: Find built kext
+        run: |
+          find build -name "AirportItlwm.kext" -print
+
+      - name: Package
+        run: |
+          KEXT="$(find build -path '*Tahoe*' -name 'AirportItlwm.kext' | head -1)"
+
+          if [ -z "$KEXT" ]; then
+            echo "Tahoe kext not found"
+            exit 1
+          fi
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$KEXT" \
+            AirportItlwm-Tahoe.zip
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirportItlwm-Tahoe
+          path: AirportItlwm-Tahoe.zip

@@ -1,4 +1,4 @@
-name: Build Tahoe AWDL Probe 1
+name: Build Tahoe AWDL VIF Test 2
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git
 
-      - name: Apply AWDL Probe 1
+      - name: Apply AWDL VIF Test 2
         run: |
           python3 <<'PY'
           from pathlib import Path
@@ -24,181 +24,221 @@ jobs:
           cpp = Path("AirportItlwm/AirportItlwmV2.cpp")
 
           h = hpp.read_text()
-
-          needle = '    virtual void *getFaultReporterFromDriver() override;\n'
-
-          addition = r'''
-          #if __IO80211_TARGET >= __MAC_26_0
-              // AWDL Probe #1 — observe Tahoe virtual-interface lifecycle.
-              virtual IO80211VirtualInterface *createVirtualInterface(ether_addr *, UInt) override;
-              virtual bool attachVirtualInterface(IO80211VirtualInterface **, ether_addr *, UInt, bool) override;
-              virtual bool detachVirtualInterface(IO80211VirtualInterface *, bool) override;
-              virtual SInt32 enableVirtualInterface(IO80211VirtualInterface *) override;
-              virtual SInt32 disableVirtualInterface(IO80211VirtualInterface *) override;
-          #endif
-          '''
-
-          if "AWDL Probe #1" not in h:
-              if needle not in h:
-                  raise SystemExit("Header insertion point not found")
-              h = h.replace(needle, needle + addition, 1)
-              hpp.write_text(h)
-
           c = cpp.read_text()
 
-          globals_needle = 'IOCommandGate *_fCommandGate;\n'
+          # ---------- HEADER ----------
+          marker = "    void publishRuntimeCounters(void);\n"
 
-          globals_add = r'''
+          add = r'''
+              // AWDL VIF Test #2
+              static IOReturn awdlVifCreateGated(
+                  OSObject *, void *, void *, void *, void *);
 
-          #if __IO80211_TARGET >= __MAC_26_0
-          // AWDL Probe #1 counters.
-          static volatile uint32_t gItlwmVifCreateCalls = 0;
-          static volatile uint32_t gItlwmVifCreateOK = 0;
-          static volatile uint32_t gItlwmVifAttachCalls = 0;
-          static volatile uint32_t gItlwmVifAttachOK = 0;
-          static volatile uint32_t gItlwmVifEnableCalls = 0;
-          static volatile uint32_t gItlwmVifDisableCalls = 0;
-          static volatile uint32_t gItlwmVifDetachCalls = 0;
-          static volatile uint32_t gItlwmVifLastRole = 0;
-          static volatile int32_t  gItlwmVifLastEnableRet = 0;
-          #endif
+              void tryAwdlVifCreate(void);
+
+              IO80211VirtualInterface *fTestAwdlVif;
+              uint32_t fTestAwdlTicks;
+              bool fTestAwdlAttempted;
           '''
 
-          if "gItlwmVifCreateCalls" not in c:
-              if globals_needle not in c:
-                  raise SystemExit("CPP globals insertion point not found")
-              c = c.replace(
-                  globals_needle,
-                  globals_needle + globals_add,
-                  1
-              )
+          if "AWDL VIF Test #2" not in h:
+              if marker not in h:
+                  raise SystemExit("header marker missing")
+              h = h.replace(marker, marker + add, 1)
 
-          impl_needle = '#if __IO80211_TARGET >= __MAC_26_0\n// Tahoe consumed'
+          # ---------- INIT ----------
+          init_marker = "bool AirportItlwm::init(OSDictionary *properties)\n{"
+
+          # Add initialization just after init begins.
+          init_find = """bool AirportItlwm::init(OSDictionary *properties)
+          {
+          """
+
+          init_replace = """bool AirportItlwm::init(OSDictionary *properties)
+          {
+          #if __IO80211_TARGET >= __MAC_26_0
+              fTestAwdlVif = NULL;
+              fTestAwdlTicks = 0;
+              fTestAwdlAttempted = false;
+          #endif
+          """
+
+          if "fTestAwdlAttempted = false" not in c:
+              if init_find not in c:
+                  raise SystemExit("init marker missing")
+              c = c.replace(init_find, init_replace, 1)
+
+          # ---------- IMPLEMENTATION ----------
+          impl_marker = "#if __IO80211_TARGET >= __MAC_26_0\n// Tahoe consumed"
 
           impl = r'''
           #if __IO80211_TARGET >= __MAC_26_0
 
-          IO80211VirtualInterface *
-          AirportItlwm::createVirtualInterface(ether_addr *addr, UInt role)
+          static uint32_t gAwdlTestAttempt = 0;
+          static uint32_t gAwdlTestAttachOK = 0;
+          static uint32_t gAwdlTestEnableOK = 0;
+          static uint32_t gAwdlTestRole = 0;
+          static uint32_t gAwdlTestHasObject = 0;
+          static int32_t  gAwdlTestEnableRet = 0;
+
+          IOReturn
+          AirportItlwm::awdlVifCreateGated(
+              OSObject *owner,
+              void *,
+              void *,
+              void *,
+              void *)
           {
-              gItlwmVifCreateCalls++;
-              gItlwmVifLastRole = role;
+              AirportItlwm *self =
+                  OSDynamicCast(AirportItlwm, owner);
 
-              IO80211VirtualInterface *v =
-                  super::createVirtualInterface(addr, role);
+              if (!self)
+                  return kIOReturnBadArgument;
 
-              if (v != NULL)
-                  gItlwmVifCreateOK++;
+              if (self->fTestAwdlAttempted)
+                  return kIOReturnSuccess;
 
-              return v;
-          }
+              self->fTestAwdlAttempted = true;
+              gAwdlTestAttempt++;
 
-          bool
-          AirportItlwm::attachVirtualInterface(
-              IO80211VirtualInterface **interface,
-              ether_addr *addr,
-              UInt role,
-              bool option)
-          {
-              gItlwmVifAttachCalls++;
-              gItlwmVifLastRole = role;
+              IOEthernetAddress hw;
+              bzero(&hw, sizeof(hw));
 
-              bool ret =
-                  super::attachVirtualInterface(
-                      interface,
-                      addr,
-                      role,
-                      option
+              if (self->getHardwareAddress(&hw) != kIOReturnSuccess)
+                  return kIOReturnError;
+
+              ether_addr mac;
+              memcpy(&mac, hw.bytes, 6);
+
+              // Locally administered, unicast address.
+              mac.octet[0] |= 0x02;
+              mac.octet[0] &= 0xFE;
+              mac.octet[5] ^= 0x40;
+
+              IO80211VirtualInterface *vif = NULL;
+
+              bool attached =
+                  self->super::attachVirtualInterface(
+                      &vif,
+                      &mac,
+                      APPLE80211_VIF_AWDL,
+                      true
                   );
 
-              if (ret)
-                  gItlwmVifAttachOK++;
+              if (!attached || vif == NULL)
+                  return kIOReturnError;
 
-              return ret;
+              gAwdlTestAttachOK++;
+              gAwdlTestHasObject = 1;
+              gAwdlTestRole = vif->getInterfaceRole();
+
+              self->fTestAwdlVif = vif;
+
+              SInt32 er =
+                  self->super::enableVirtualInterface(vif);
+
+              gAwdlTestEnableRet = er;
+
+              if (er == 0) {
+                  gAwdlTestEnableOK++;
+
+                  vif->setEnabledBySystem(true);
+                  vif->setLinkState(
+                      kIO80211NetworkLinkUp,
+                      0
+                  );
+
+                  vif->postMessage(
+                      APPLE80211_M_LINK_CHANGED
+                  );
+              }
+
+              return er;
           }
 
-          bool
-          AirportItlwm::detachVirtualInterface(
-              IO80211VirtualInterface *interface,
-              bool option)
-          {
-              gItlwmVifDetachCalls++;
 
-              return super::detachVirtualInterface(
-                  interface,
-                  option
+          void
+          AirportItlwm::tryAwdlVifCreate(void)
+          {
+              if (fTestAwdlAttempted)
+                  return;
+
+              struct ieee80211com *ic =
+                  fHalService->get80211Controller();
+
+              // Wait for normal infrastructure Wi-Fi first.
+              if (ic->ic_state != IEEE80211_S_RUN)
+                  return;
+
+              // 10 watchdog ticks ~= 10 seconds connected.
+              if (++fTestAwdlTicks < 10)
+                  return;
+
+              _fCommandGate->runAction(
+                  awdlVifCreateGated
               );
-          }
-
-          SInt32
-          AirportItlwm::enableVirtualInterface(
-              IO80211VirtualInterface *interface)
-          {
-              gItlwmVifEnableCalls++;
-
-              SInt32 ret =
-                  super::enableVirtualInterface(interface);
-
-              gItlwmVifLastEnableRet = ret;
-
-              return ret;
-          }
-
-          SInt32
-          AirportItlwm::disableVirtualInterface(
-              IO80211VirtualInterface *interface)
-          {
-              gItlwmVifDisableCalls++;
-
-              return super::disableVirtualInterface(interface);
           }
 
           #endif
 
           '''
 
-          if "AirportItlwm::createVirtualInterface(ether_addr *addr" not in c:
-              if impl_needle not in c:
-                  raise SystemExit("Implementation insertion point not found")
-
+          if "AirportItlwm::awdlVifCreateGated" not in c:
+              if impl_marker not in c:
+                  raise SystemExit("implementation marker missing")
               c = c.replace(
-                  impl_needle,
-                  impl + impl_needle,
+                  impl_marker,
+                  impl + impl_marker,
                   1
               )
 
-          publish_needle = '''void AirportItlwm::publishRuntimeCounters()
+          # ---------- WATCHDOG ----------
+          wd_find = """    publishRuntimeCounters();
+          #endif
+              watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
+          """
+
+          wd_replace = """    publishRuntimeCounters();
+              tryAwdlVifCreate();
+          #endif
+              watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
+          """
+
+          if "tryAwdlVifCreate();" not in c:
+              if wd_find not in c:
+                  raise SystemExit("watchdog marker missing")
+              c = c.replace(wd_find, wd_replace, 1)
+
+          # ---------- COUNTERS ----------
+          pub_find = """void AirportItlwm::publishRuntimeCounters()
           {
-          '''
+          """
 
-          publish_add = '''void AirportItlwm::publishRuntimeCounters()
+          pub_replace = """void AirportItlwm::publishRuntimeCounters()
           {
-              // AWDL Probe #1: publish outside Apple's virtual-interface callbacks.
-              setProperty("ItlwmVifCreateCalls", (UInt64)gItlwmVifCreateCalls, 32);
-              setProperty("ItlwmVifCreateOK", (UInt64)gItlwmVifCreateOK, 32);
-              setProperty("ItlwmVifAttachCalls", (UInt64)gItlwmVifAttachCalls, 32);
-              setProperty("ItlwmVifAttachOK", (UInt64)gItlwmVifAttachOK, 32);
-              setProperty("ItlwmVifEnableCalls", (UInt64)gItlwmVifEnableCalls, 32);
-              setProperty("ItlwmVifDisableCalls", (UInt64)gItlwmVifDisableCalls, 32);
-              setProperty("ItlwmVifDetachCalls", (UInt64)gItlwmVifDetachCalls, 32);
-              setProperty("ItlwmVifLastRole", (UInt64)gItlwmVifLastRole, 32);
-              setProperty("ItlwmVifLastEnableRet",
-                          (UInt64)(uint32_t)gItlwmVifLastEnableRet, 32);
-          '''
+              setProperty("ItlwmAwdlAttempt",
+                          (UInt64)gAwdlTestAttempt, 32);
+              setProperty("ItlwmAwdlAttachOK",
+                          (UInt64)gAwdlTestAttachOK, 32);
+              setProperty("ItlwmAwdlEnableOK",
+                          (UInt64)gAwdlTestEnableOK, 32);
+              setProperty("ItlwmAwdlRole",
+                          (UInt64)gAwdlTestRole, 32);
+              setProperty("ItlwmAwdlHasObject",
+                          (UInt64)gAwdlTestHasObject, 32);
+              setProperty("ItlwmAwdlEnableRet",
+                          (UInt64)(uint32_t)gAwdlTestEnableRet, 32);
+          """
 
-          if "ItlwmVifCreateCalls\"" not in c:
-              if publish_needle not in c:
-                  raise SystemExit("publishRuntimeCounters insertion point not found")
+          if '"ItlwmAwdlAttempt"' not in c:
+              if pub_find not in c:
+                  raise SystemExit("publish marker missing")
+              c = c.replace(pub_find, pub_replace, 1)
 
-              c = c.replace(
-                  publish_needle,
-                  publish_add,
-                  1
-              )
-
+          hpp.write_text(h)
           cpp.write_text(c)
 
-          print("AWDL Probe #1 applied.")
+          print("AWDL VIF Test #2 applied")
           PY
 
       - name: Build AirportItlwm Tahoe
@@ -209,11 +249,7 @@ jobs:
             -configuration Release \
             build
 
-      - name: Find Tahoe kext
-        run: |
-          find build -name "AirportItlwm.kext" -print
-
-      - name: Package AWDL Probe 1
+      - name: Package
         run: |
           KEXT="$(find build -path '*Tahoe*' -name 'AirportItlwm.kext' | head -1)"
 
@@ -224,10 +260,10 @@ jobs:
 
           ditto -c -k --sequesterRsrc --keepParent \
             "$KEXT" \
-            AirportItlwm-Tahoe-AWDL-PROBE1.zip
+            AirportItlwm-Tahoe-AWDL-VIF-TEST2.zip
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: AirportItlwm-Tahoe-AWDL-PROBE1
-          path: AirportItlwm-Tahoe-AWDL-PROBE1.zip
+          name: AirportItlwm-Tahoe-AWDL-VIF-TEST2
+          path: AirportItlwm-Tahoe-AWDL-VIF-TEST2.zip
